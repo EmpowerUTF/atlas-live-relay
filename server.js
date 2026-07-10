@@ -29,6 +29,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "atlas-live-relay",
+        version: "1.1.0",
         model: GEMINI_MODEL,
       }),
     );
@@ -104,11 +105,13 @@ atlasWss.on("connection", (atlas) => {
     const setupMessage = {
       setup: {
         model: `models/${GEMINI_MODEL}`,
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: ATLAS_VOICE,
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: ATLAS_VOICE,
+              },
             },
           },
         },
@@ -147,6 +150,7 @@ atlasWss.on("connection", (atlas) => {
 
     if (message.setupComplete) {
       geminiReady = true;
+      console.log("Gemini setup complete for Atlas.");
       sendAtlasJson({ type: "ready", model: GEMINI_MODEL, voice: ATLAS_VOICE });
       return;
     }
