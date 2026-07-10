@@ -31,7 +31,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "atlas-live-relay",
-        version: "1.3.0-manual-vad",
+        version: "1.4.0-paced-audio",
         model: GEMINI_MODEL,
         voice: ATLAS_VOICE,
       }),
@@ -78,6 +78,13 @@ server.on("upgrade", (req, socket, head) => {
 atlasWss.on("connection", (atlas) => {
   console.log("Atlas device connected.");
 
+  try {
+    atlas._socket?.setNoDelay(true);
+    atlas._socket?.setKeepAlive(true, 10000);
+  } catch {
+    // Socket tuning is best effort only.
+  }
+
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
   let session = null;
@@ -87,12 +94,101 @@ atlasWss.on("connection", (atlas) => {
   let reconnectTimer = null;
   let inputAudioBytes = 0;
   let outputAudioBytes = 0;
+  let outputAudioSentBytes = 0;
+  let outputQueue = [];
+  let outputQueueOffset = 0;
+  let pendingTurnComplete = false;
+
+  const OUTPUT_FRAME_BYTES = 960; // 20 ms of 24 kHz mono PCM16
+  const OUTPUT_FRAME_MS = 20;
+  const MAX_ATLAS_BUFFERED_BYTES = 64 * 1024;
 
   const sendAtlasJson = (payload) => {
     if (atlas.readyState === WebSocket.OPEN) {
       atlas.send(JSON.stringify(payload));
     }
   };
+
+  const clearOutputQueue = () => {
+    outputQueue = [];
+    outputQueueOffset = 0;
+    outputAudioSentBytes = 0;
+    pendingTurnComplete = false;
+  };
+
+  const queuedOutputBytes = () => {
+    let total = 0;
+
+    for (let i = 0; i < outputQueue.length; i += 1) {
+      total += outputQueue[i].length;
+    }
+
+    return Math.max(0, total - outputQueueOffset);
+  };
+
+  const takeOutputFrame = (maximumBytes) => {
+    if (outputQueue.length === 0) return null;
+
+    const parts = [];
+    let total = 0;
+    let remaining = maximumBytes;
+
+    while (remaining > 0 && outputQueue.length > 0) {
+      const first = outputQueue[0];
+      const available = first.length - outputQueueOffset;
+      const take = Math.min(available, remaining);
+
+      parts.push(first.subarray(outputQueueOffset, outputQueueOffset + take));
+      total += take;
+      remaining -= take;
+      outputQueueOffset += take;
+
+      if (outputQueueOffset >= first.length) {
+        outputQueue.shift();
+        outputQueueOffset = 0;
+      }
+    }
+
+    if (parts.length === 1) return parts[0];
+    return Buffer.concat(parts, total);
+  };
+
+  const audioPacer = setInterval(() => {
+    if (closing || atlas.readyState !== WebSocket.OPEN) return;
+
+    if (atlas.bufferedAmount > MAX_ATLAS_BUFFERED_BYTES) {
+      return;
+    }
+
+    const frame = takeOutputFrame(OUTPUT_FRAME_BYTES);
+
+    if (frame && frame.length > 0) {
+      atlas.send(frame, { binary: true });
+      outputAudioSentBytes += frame.length;
+      return;
+    }
+
+    if (pendingTurnComplete) {
+      console.log(
+        `Gemini audio delivered. Generated: ${outputAudioBytes}, sent: ${outputAudioSentBytes}`,
+      );
+
+      sendAtlasJson({ type: "turn_complete" });
+      pendingTurnComplete = false;
+      outputAudioBytes = 0;
+      outputAudioSentBytes = 0;
+    }
+  }, OUTPUT_FRAME_MS);
+
+  const pingTimer = setInterval(() => {
+    if (!closing && atlas.readyState === WebSocket.OPEN) {
+      try {
+        atlas.ping();
+      } catch {
+        // The close handler will clean up if the socket has died.
+      }
+    }
+  }, 20000);
 
   const scheduleGeminiReconnect = () => {
     if (closing || atlas.readyState !== WebSocket.OPEN || reconnectTimer) return;
@@ -112,6 +208,7 @@ atlasWss.on("connection", (atlas) => {
     if (content) {
       if (content.interrupted) {
         console.log("Gemini response interrupted.");
+        clearOutputQueue();
         sendAtlasJson({ type: "interrupted" });
       }
 
@@ -126,21 +223,21 @@ atlasWss.on("connection", (atlas) => {
 
         const pcm = Buffer.from(inline.data, "base64");
         outputAudioBytes += pcm.length;
-
-        if (atlas.readyState === WebSocket.OPEN) {
-          atlas.send(pcm, { binary: true });
-        }
+        outputQueue.push(pcm);
       }
 
       if (content.generationComplete) {
-        console.log(`Gemini generation complete. Output bytes: ${outputAudioBytes}`);
+        console.log(
+          `Gemini generation complete. Output bytes: ${outputAudioBytes}, queued: ${queuedOutputBytes()}`,
+        );
         sendAtlasJson({ type: "generation_complete" });
       }
 
       if (content.turnComplete) {
-        console.log(`Gemini turn complete. Output bytes: ${outputAudioBytes}`);
-        sendAtlasJson({ type: "turn_complete" });
-        outputAudioBytes = 0;
+        console.log(
+          `Gemini turn complete. Output bytes: ${outputAudioBytes}, queued: ${queuedOutputBytes()}`,
+        );
+        pendingTurnComplete = true;
       }
     }
 
@@ -216,6 +313,7 @@ atlasWss.on("connection", (atlas) => {
       geminiReady = true;
       inputAudioBytes = 0;
       outputAudioBytes = 0;
+      clearOutputQueue();
       console.log("Gemini Live session ready through official SDK.");
 
       sendAtlasJson({
@@ -264,6 +362,7 @@ atlasWss.on("connection", (atlas) => {
       if (control.type === "activity_start") {
         inputAudioBytes = 0;
         outputAudioBytes = 0;
+        clearOutputQueue();
         console.log("Atlas activity start.");
         session.sendRealtimeInput({ activityStart: {} });
       } else if (control.type === "activity_end") {
@@ -289,10 +388,14 @@ atlasWss.on("connection", (atlas) => {
     console.error("Atlas WebSocket error:", error.message);
   });
 
-  atlas.on("close", () => {
-    console.log("Atlas device disconnected.");
+  atlas.on("close", (code, reasonBuffer) => {
+    const reason = reasonBuffer?.toString?.() || "";
+    console.log(`Atlas device disconnected. Code: ${code} ${reason}`);
     closing = true;
     geminiReady = false;
+    clearInterval(audioPacer);
+    clearInterval(pingTimer);
+    clearOutputQueue();
 
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -311,7 +414,7 @@ atlasWss.on("connection", (atlas) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Atlas Live Relay listening on port ${PORT}`);
-  console.log("Relay version: 1.3.0-manual-vad");
+  console.log("Relay version: 1.4.0-paced-audio");
   console.log(`Model: ${GEMINI_MODEL}`);
   console.log(`Voice: ${ATLAS_VOICE}`);
 });
