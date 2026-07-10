@@ -1,6 +1,6 @@
 {
   "name": "atlas-live-relay",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "Low-latency WebSocket relay between Atlas ESP32 and Gemini Live API",
@@ -12,6 +12,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@google/genai": "latest",
     "ws": "^8.18.3"
   }
 }
