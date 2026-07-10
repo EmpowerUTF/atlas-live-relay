@@ -31,7 +31,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "atlas-live-relay",
-        version: "1.2.0-sdk",
+        version: "1.3.0-manual-vad",
         model: GEMINI_MODEL,
         voice: ATLAS_VOICE,
       }),
@@ -83,6 +83,10 @@ atlasWss.on("connection", (atlas) => {
   let session = null;
   let geminiReady = false;
   let closing = false;
+  let connectInFlight = false;
+  let reconnectTimer = null;
+  let inputAudioBytes = 0;
+  let outputAudioBytes = 0;
 
   const sendAtlasJson = (payload) => {
     if (atlas.readyState === WebSocket.OPEN) {
@@ -90,20 +94,16 @@ atlasWss.on("connection", (atlas) => {
     }
   };
 
-  const closeSession = (reason = "session_closed") => {
-    if (closing) return;
-    closing = true;
+  const scheduleGeminiReconnect = () => {
+    if (closing || atlas.readyState !== WebSocket.OPEN || reconnectTimer) return;
+
     geminiReady = false;
+    sendAtlasJson({ type: "gemini_reconnecting" });
 
-    try {
-      session?.close();
-    } catch (error) {
-      console.error("Gemini session close error:", error?.message || error);
-    }
-
-    if (atlas.readyState === WebSocket.OPEN) {
-      atlas.close(1011, reason);
-    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectGemini();
+    }, 750);
   };
 
   const handleGeminiMessage = (message) => {
@@ -111,35 +111,21 @@ atlasWss.on("connection", (atlas) => {
 
     if (content) {
       if (content.interrupted) {
+        console.log("Gemini response interrupted.");
         sendAtlasJson({ type: "interrupted" });
-      }
-
-      if (content.inputTranscription?.text) {
-        sendAtlasJson({
-          type: "input_transcript",
-          text: content.inputTranscription.text,
-        });
-      }
-
-      if (content.outputTranscription?.text) {
-        sendAtlasJson({
-          type: "output_transcript",
-          text: content.outputTranscription.text,
-        });
       }
 
       const parts = content.modelTurn?.parts || [];
 
       for (const part of parts) {
         const inline = part.inlineData;
-
         if (!inline?.data) continue;
 
         const mimeType = inline.mimeType || "";
-
         if (!mimeType.startsWith("audio/pcm")) continue;
 
         const pcm = Buffer.from(inline.data, "base64");
+        outputAudioBytes += pcm.length;
 
         if (atlas.readyState === WebSocket.OPEN) {
           atlas.send(pcm, { binary: true });
@@ -147,26 +133,30 @@ atlasWss.on("connection", (atlas) => {
       }
 
       if (content.generationComplete) {
+        console.log(`Gemini generation complete. Output bytes: ${outputAudioBytes}`);
         sendAtlasJson({ type: "generation_complete" });
       }
 
       if (content.turnComplete) {
+        console.log(`Gemini turn complete. Output bytes: ${outputAudioBytes}`);
         sendAtlasJson({ type: "turn_complete" });
+        outputAudioBytes = 0;
       }
     }
 
     if (message?.goAway) {
+      console.log("Gemini sent goAway.");
       sendAtlasJson({ type: "go_away", detail: message.goAway });
-    }
-
-    if (message?.usageMetadata) {
-      sendAtlasJson({ type: "usage", usage: message.usageMetadata });
     }
   };
 
-  const startGemini = async () => {
+  const connectGemini = async () => {
+    if (closing || connectInFlight || atlas.readyState !== WebSocket.OPEN) return;
+
+    connectInFlight = true;
+
     try {
-      session = await ai.live.connect({
+      const newSession = await ai.live.connect({
         model: GEMINI_MODEL,
         config: {
           responseModalities: [Modality.AUDIO],
@@ -178,15 +168,9 @@ atlasWss.on("connection", (atlas) => {
               },
             },
           },
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
           realtimeInputConfig: {
             automaticActivityDetection: {
-              disabled: false,
-              startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
-              endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-              prefixPaddingMs: 100,
-              silenceDurationMs: 500,
+              disabled: true,
             },
           },
         },
@@ -213,27 +197,25 @@ atlasWss.on("connection", (atlas) => {
             const code = event?.code ?? 1000;
             const reason = event?.reason || "";
             console.log(`Gemini SDK closed: ${code} ${reason}`);
-
-            sendAtlasJson({
-              type: "closed",
-              source: "gemini",
-              code,
-              reason,
-            });
+            geminiReady = false;
+            session = null;
 
             if (!closing) {
-              closeSession("gemini_closed");
+              scheduleGeminiReconnect();
             }
           },
         },
       });
 
       if (closing) {
-        session.close();
+        newSession.close();
         return;
       }
 
+      session = newSession;
       geminiReady = true;
+      inputAudioBytes = 0;
+      outputAudioBytes = 0;
       console.log("Gemini Live session ready through official SDK.");
 
       sendAtlasJson({
@@ -244,25 +226,24 @@ atlasWss.on("connection", (atlas) => {
     } catch (error) {
       const detail = error?.message || String(error);
       console.error("Gemini SDK connection failed:", detail);
-
       sendAtlasJson({
         type: "error",
         source: "gemini",
         message: detail,
       });
-
-      closeSession("gemini_connect_failed");
+      scheduleGeminiReconnect();
+    } finally {
+      connectInFlight = false;
     }
   };
 
   atlas.on("message", (data, isBinary) => {
-    if (!geminiReady || !session) {
-      return;
-    }
+    if (!geminiReady || !session) return;
 
     try {
       if (isBinary) {
         const pcm = Buffer.from(data);
+        inputAudioBytes += pcm.length;
 
         session.sendRealtimeInput({
           audio: {
@@ -270,24 +251,25 @@ atlasWss.on("connection", (atlas) => {
             mimeType: "audio/pcm;rate=16000",
           },
         });
-
         return;
       }
 
       let control;
-
       try {
         control = JSON.parse(data.toString());
       } catch {
         return;
       }
 
-      if (control.type === "audio_stream_end") {
-        session.sendRealtimeInput({ audioStreamEnd: true });
-      } else if (
-        control.type === "text" &&
-        typeof control.text === "string"
-      ) {
+      if (control.type === "activity_start") {
+        inputAudioBytes = 0;
+        outputAudioBytes = 0;
+        console.log("Atlas activity start.");
+        session.sendRealtimeInput({ activityStart: {} });
+      } else if (control.type === "activity_end") {
+        console.log(`Atlas activity end. Input bytes: ${inputAudioBytes}`);
+        session.sendRealtimeInput({ activityEnd: {} });
+      } else if (control.type === "text" && typeof control.text === "string") {
         session.sendRealtimeInput({ text: control.text });
       } else if (control.type === "ping") {
         sendAtlasJson({ type: "pong", at: Date.now() });
@@ -295,7 +277,6 @@ atlasWss.on("connection", (atlas) => {
     } catch (error) {
       const detail = error?.message || String(error);
       console.error("Relay input forwarding error:", detail);
-
       sendAtlasJson({
         type: "error",
         source: "relay",
@@ -310,25 +291,27 @@ atlasWss.on("connection", (atlas) => {
 
   atlas.on("close", () => {
     console.log("Atlas device disconnected.");
+    closing = true;
+    geminiReady = false;
 
-    if (!closing) {
-      closing = true;
-      geminiReady = false;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
 
-      try {
-        session?.close();
-      } catch (error) {
-        console.error("Gemini session close error:", error?.message || error);
-      }
+    try {
+      session?.close();
+    } catch (error) {
+      console.error("Gemini session close error:", error?.message || error);
     }
   });
 
-  startGemini();
+  connectGemini();
 });
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Atlas Live Relay listening on port ${PORT}`);
-  console.log("Relay version: 1.2.0-sdk");
+  console.log("Relay version: 1.3.0-manual-vad");
   console.log(`Model: ${GEMINI_MODEL}`);
   console.log(`Voice: ${ATLAS_VOICE}`);
 });
