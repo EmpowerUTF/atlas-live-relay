@@ -5,7 +5,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const RELAY_VERSION = "3.1.1";
+const RELAY_VERSION = "3.1.3";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ATLAS_DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const GEMINI_PRIMARY_MODEL =
@@ -14,7 +14,7 @@ const GEMINI_FALLBACK_MODEL =
   process.env.GEMINI_FALLBACK_MODEL ||
   "gemini-2.5-flash-native-audio-preview-12-2025";
 const GEMINI_RETRY_DELAY_MS = 1500;
-const ATLAS_VOICE = "Orus";
+const ATLAS_VOICE = "Charon";
 const BASE_SYSTEM_INSTRUCTION =
   process.env.ATLAS_SYSTEM_INSTRUCTION ||
   "You are Atlas, a fast, practical AI companion. Speak naturally and directly. " +
@@ -24,7 +24,10 @@ const LANGUAGE_AND_VOICE_LOCK =
   "LANGUAGE AND VOICE REQUIREMENT: Always speak in English only. " +
   "Never answer in Spanish or any other language, even if automatic transcription " +
   "mistakenly labels the owner's English speech as another language. " +
-  "Use a natural adult male voice with a clear, neutral American English accent. " +
+  "Speak as an articulate adult British man using cultivated modern Received " +
+  "Pronunciation: sophisticated, measured, intelligent, warm, and natural. " +
+  "Avoid American pronunciation, exaggerated aristocratic affectation, theatrical " +
+  "delivery, rushed speech, and vocal fry. Use clean phrasing and an even pace. " +
   "Do not imitate the language or accent inferred from noisy audio. " +
   "Only change language if the owner explicitly says the exact words: switch language.";
 
@@ -35,7 +38,7 @@ const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 const MAX_ATLAS_MESSAGE_BYTES = 64 * 1024;
 const PCM_SLICE_BYTES = 1920; // 40 ms of 24 kHz mono PCM16.
 const PCM_SLICE_MS = 40;
-const PCM_START_BUFFER_BYTES = 14_400; // 300 ms before first downlink frame.
+const PCM_START_BUFFER_BYTES = 19_200; // 400 ms before first downlink frame.
 const ATLAS_BACKPRESSURE_BYTES = 128 * 1024;
 const SESSION_HANDLE_MAX_AGE_MS = 90 * 60 * 1000;
 const RECENT_HISTORY_TURNS = 10;
@@ -269,31 +272,91 @@ function historyTurns(recentTurns) {
   return turns;
 }
 
+class PcmChunkQueue {
+  constructor() {
+    this.chunks = [];
+    this.headOffset = 0;
+    this.length = 0;
+  }
+
+  push(pcm) {
+    if (!pcm?.length) return;
+    const chunk = Buffer.from(pcm);
+    this.chunks.push(chunk);
+    this.length += chunk.length;
+  }
+
+  take(byteCount) {
+    if (byteCount <= 0 || this.length < byteCount) return null;
+
+    const output = Buffer.allocUnsafe(byteCount);
+    let outputOffset = 0;
+
+    while (outputOffset < byteCount) {
+      const head = this.chunks[0];
+      const available = head.length - this.headOffset;
+      const wanted = byteCount - outputOffset;
+      const copyCount = available < wanted ? available : wanted;
+
+      head.copy(
+        output,
+        outputOffset,
+        this.headOffset,
+        this.headOffset + copyCount,
+      );
+
+      outputOffset += copyCount;
+      this.headOffset += copyCount;
+      this.length -= copyCount;
+
+      if (this.headOffset >= head.length) {
+        this.chunks.shift();
+        this.headOffset = 0;
+      }
+    }
+
+    return output;
+  }
+
+  takeAllEven() {
+    const evenLength = this.length & ~1;
+    if (!evenLength) return null;
+    return this.take(evenLength);
+  }
+
+  clear() {
+    this.chunks = [];
+    this.headOffset = 0;
+    this.length = 0;
+  }
+}
+
 class PcmPacer {
   constructor(atlas, onDrained) {
     this.atlas = atlas;
     this.onDrained = onDrained;
-    this.buffer = Buffer.alloc(0);
+    this.queue = new PcmChunkQueue();
     this.timer = null;
     this.done = false;
     this.closed = false;
     this.started = false;
     this.nextSendAt = 0;
+    this.lateTicks = 0;
+    this.maxLateMs = 0;
+    this.backpressureWaits = 0;
   }
 
   enqueue(pcm) {
     if (this.closed || !pcm?.length) return;
-    this.buffer = this.buffer.length
-      ? Buffer.concat([this.buffer, pcm])
-      : Buffer.from(pcm);
+    this.queue.push(pcm);
 
-    // Build a real jitter reserve before starting. The prior relay began after
-    // only 80 ms and then scheduled each next packet 80 ms after the previous
-    // send callback, so callback delay accumulated until the ESP32 starved.
+    // Keep a modest reserve before playback starts. PCM is held as chunks
+    // instead of repeatedly Buffer.concat-ing the whole response, avoiding
+    // growing copies and garbage-collection pauses during speech.
     if (!this.timer &&
         (this.started ||
          this.done ||
-         this.buffer.length >= PCM_START_BUFFER_BYTES)) {
+         this.queue.length >= PCM_START_BUFFER_BYTES)) {
       this.schedule(0);
     }
   }
@@ -305,7 +368,7 @@ class PcmPacer {
 
   clear() {
     this.closed = true;
-    this.buffer = Buffer.alloc(0);
+    this.queue.clear();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }
@@ -325,7 +388,7 @@ class PcmPacer {
     }
 
     if (!this.started) {
-      if (!this.done && this.buffer.length < PCM_START_BUFFER_BYTES) {
+      if (!this.done && this.queue.length < PCM_START_BUFFER_BYTES) {
         return;
       }
       this.started = true;
@@ -333,44 +396,59 @@ class PcmPacer {
     }
 
     if (this.atlas.bufferedAmount > ATLAS_BACKPRESSURE_BYTES) {
-      this.schedule(5);
+      this.backpressureWaits++;
+      this.schedule(4);
       return;
     }
 
-    if (this.buffer.length >= PCM_SLICE_BYTES) {
-      const slice = Buffer.from(this.buffer.subarray(0, PCM_SLICE_BYTES));
-      this.buffer = this.buffer.subarray(PCM_SLICE_BYTES);
-
-      // Use an absolute audio clock. This prevents WebSocket callback latency
-      // from being added to every 40 ms interval.
+    if (this.queue.length >= PCM_SLICE_BYTES) {
+      const slice = this.queue.take(PCM_SLICE_BYTES);
       const now = Date.now();
-      if (this.nextSendAt < now - PCM_SLICE_MS * 2) {
+      const lateMs = Math.max(0, now - this.nextSendAt);
+
+      if (lateMs > 3) {
+        this.lateTicks++;
+        if (lateMs > this.maxLateMs) this.maxLateMs = lateMs;
+      }
+
+      // If the event loop was briefly delayed, reset only after a severe lag.
+      // Ordinary timer jitter is absorbed by the relay and ESP32 reserves.
+      if (this.nextSendAt < now - PCM_SLICE_MS * 4) {
         this.nextSendAt = now;
       }
 
-      this.atlas.send(slice, { binary: true }, (error) => {
-        if (error) {
-          console.error("Atlas PCM send failed:", error.message);
-          this.clear();
-          return;
-        }
+      try {
+        // Do not serialize the audio clock behind ws send callbacks. ws queues
+        // this frame immediately; bufferedAmount supplies backpressure.
+        this.atlas.send(slice, { binary: true }, (error) => {
+          if (error && !this.closed) {
+            console.error("Atlas PCM send failed:", error.message);
+            this.clear();
+          }
+        });
+      } catch (error) {
+        console.error("Atlas PCM send threw:", error.message);
+        this.clear();
+        return;
+      }
 
-        this.nextSendAt += PCM_SLICE_MS;
-        this.schedule(Math.max(0, this.nextSendAt - Date.now()));
-      });
+      this.nextSendAt += PCM_SLICE_MS;
+      this.schedule(Math.max(0, this.nextSendAt - Date.now()));
       return;
     }
 
     if (this.done) {
-      const tailLength = this.buffer.length & ~1;
-      const tail = tailLength
-        ? Buffer.from(this.buffer.subarray(0, tailLength))
-        : null;
-      this.buffer = Buffer.alloc(0);
+      const tail = this.queue.takeAllEven();
+      this.queue.clear();
 
       const complete = () => {
         if (this.closed) return;
         this.closed = true;
+        console.log(
+          `PCM pacing complete: lateTicks=${this.lateTicks} ` +
+            `maxLateMs=${this.maxLateMs} ` +
+            `backpressureWaits=${this.backpressureWaits}`,
+        );
         this.onDrained();
       };
 
@@ -389,11 +467,12 @@ class PcmPacer {
       return;
     }
 
-    // Gemini has not produced another full slice yet. Poll briefly without
-    // advancing the audio clock; the ESP32 still has the 300 ms reserve.
-    this.schedule(4);
+    // Gemini has not produced another full slice yet. Poll without advancing
+    // the audio clock; both ends retain enough PCM to absorb ordinary jitter.
+    this.schedule(3);
   }
 }
+
 const server = http.createServer(async (req, res) => {
   let parsed;
   try {
@@ -414,7 +493,8 @@ const server = http.createServer(async (req, res) => {
       mode: "continuous-live-pcm-official-genai-sdk",
       geminiTransport: "official-google-genai-sdk",
       uplink: "20ms-live-pcm",
-      downlink: "40ms-clocked-pcm-with-300ms-jitter-buffer",
+      downlink: "40ms-clocked-pcm-with-400ms-jitter-buffer",
+      transportHeartbeat: "activity-aware-120s-stale-timeout",
       durableMemory: SUPABASE_ENABLED,
     });
     return;
@@ -556,7 +636,7 @@ atlasWss.on("connection", (atlas, req) => {
   let activeModelIndex = 0;
   let geminiConnectionSerial = 0;
   let geminiRetryTimer = null;
-  let atlasTransportAlive = true;
+  let atlasLastSeenAt = Date.now();
   let atlasTransportHeartbeat = null;
 
   const geminiModels = [...new Set(
@@ -985,6 +1065,7 @@ atlasWss.on("connection", (atlas, req) => {
   };
 
   atlas.on("message", (data, isBinary) => {
+    atlasLastSeenAt = Date.now();
     if (isBinary) {
       if (!geminiReady || !geminiSession) return;
       if (!currentTurn?.active) return;
@@ -1062,23 +1143,26 @@ atlasWss.on("connection", (atlas, req) => {
   });
 
 
-  // Keep the Railway edge and ESP32 WebSocket alive independently of Gemini.
-  // This is transport-level ping/pong, so a Gemini session rotation cannot
-  // make Atlas lose its relay socket.
+  // Keep the Railway edge alive without killing an active ESP32 after one
+  // delayed pong. Any binary audio, control message, or pong proves liveness.
+  // The old one-strike policy caused otherwise healthy second turns to die.
   atlas.on("pong", () => {
-    atlasTransportAlive = true;
+    atlasLastSeenAt = Date.now();
   });
 
   atlasTransportHeartbeat = setInterval(() => {
     if (closed || atlas.readyState !== WebSocket.OPEN) return;
 
-    if (!atlasTransportAlive) {
-      console.warn(`[${deviceId}] Atlas transport heartbeat missed; terminating stale socket.`);
+    const idleMs = Date.now() - atlasLastSeenAt;
+    if (idleMs > 120_000) {
+      console.warn(
+        `[${deviceId}] Atlas transport silent for ${idleMs} ms; ` +
+          "terminating genuinely stale socket.",
+      );
       atlas.terminate();
       return;
     }
 
-    atlasTransportAlive = false;
     try {
       atlas.ping();
     } catch (error) {
