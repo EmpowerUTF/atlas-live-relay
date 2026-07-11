@@ -13,10 +13,11 @@ const SYSTEM_INSTRUCTION =
   "You are Atlas, a fast, practical AI companion. Speak naturally and concisely. " +
     "Answer directly. Keep routine answers short unless detail is requested.";
 
-const RELAY_VERSION = "2.1.0-on-demand";
+const RELAY_VERSION = "2.2.0-buffered-response";
 const INPUT_FRAME_BYTES = 3200; // 100 ms of 16 kHz mono PCM16
 const MAX_INPUT_BYTES = 192000; // 6 seconds maximum
 const TURN_TIMEOUT_MS = 30000;
+const MAX_OUTPUT_BYTES = 384000; // 8 seconds of 24 kHz mono PCM16
 
 if (!GEMINI_API_KEY) {
   console.error("Missing required environment variable: GEMINI_API_KEY");
@@ -84,9 +85,9 @@ function collectRequestBody(req) {
 async function runGeminiTurn(audio, res) {
   let session = null;
   let settled = false;
-  let responseStarted = false;
-  let outputBytes = 0;
   let timeout = null;
+  let outputBytes = 0;
+  const outputChunks = [];
 
   const closeSession = () => {
     try {
@@ -105,17 +106,31 @@ async function runGeminiTurn(audio, res) {
       timeout = null;
     }
 
-    if (!responseStarted) {
+    if (outputBytes === 0) {
       safeJson(res, 502, {
         ok: false,
         error: "gemini_returned_no_audio",
       });
-    } else if (!res.writableEnded) {
-      res.end();
+      closeSession();
+      return;
     }
 
+    const completeAudio = Buffer.concat(outputChunks, outputBytes);
+
+    res.writeHead(200, {
+      "content-type": "audio/pcm;rate=24000",
+      "content-length": String(completeAudio.length),
+      "cache-control": "no-store",
+      connection: "close",
+      "x-atlas-relay-version": RELAY_VERSION,
+      "x-atlas-voice": ATLAS_VOICE,
+      "x-atlas-audio-bytes": String(completeAudio.length),
+    });
+
+    res.end(completeAudio);
+
     console.log(
-      `Atlas HTTP turn complete. Input bytes: ${audio.length}, output bytes: ${outputBytes}`,
+      `Atlas HTTP buffered response sent. Input bytes: ${audio.length}, output bytes: ${outputBytes}`,
     );
 
     setTimeout(closeSession, 50);
@@ -147,7 +162,7 @@ async function runGeminiTurn(audio, res) {
     if (!settled && !res.writableEnded) {
       settled = true;
       if (timeout) clearTimeout(timeout);
-      console.log("Atlas HTTP client disconnected during response.");
+      console.log("Atlas HTTP client disconnected before buffered response was sent.");
       closeSession();
     }
   });
@@ -198,24 +213,18 @@ async function runGeminiTurn(audio, res) {
             const pcm = Buffer.from(inline.data, "base64");
             if (pcm.length === 0) continue;
 
-            if (!responseStarted) {
-              res.writeHead(200, {
-                "content-type": "audio/pcm;rate=24000",
-                "cache-control": "no-store",
-                connection: "close",
-                "x-atlas-relay-version": RELAY_VERSION,
-                "x-atlas-voice": ATLAS_VOICE,
-              });
-              responseStarted = true;
+            if (outputBytes + pcm.length > MAX_OUTPUT_BYTES) {
+              fail(502, "gemini_audio_too_long");
+              return;
             }
 
+            outputChunks.push(pcm);
             outputBytes += pcm.length;
-            res.write(pcm);
           }
 
           if (content?.generationComplete) {
             console.log(
-              `HTTP turn Gemini generation complete. Output bytes: ${outputBytes}`,
+              `HTTP turn Gemini generation complete. Buffered output bytes: ${outputBytes}`,
             );
           }
 
@@ -300,6 +309,7 @@ const server = http.createServer(async (req, res) => {
       voice: ATLAS_VOICE,
       geminiReady: true,
       geminiMode: "on-demand-per-turn",
+      responseMode: "buffered-content-length",
     });
     return;
   }

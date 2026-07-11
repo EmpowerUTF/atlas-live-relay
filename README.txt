@@ -1,10 +1,10 @@
-ATLAS RELAY v2.1.0 — ON-DEMAND GEMINI SESSION
+ATLAS LIVE RELAY v2.2 — BUFFERED RESPONSE
 
-Replace only server.js in the existing GitHub atlas-live-relay repository.
-Do not change Railway variables, domain, device token, model, voice, port, or API key.
+Replace only server.js in the existing GitHub relay repository.
+Do not change package.json, Railway variables, keys, token, domain, port, model, or voice.
 
-Expected health response includes:
-"version":"2.1.0-on-demand"
-"geminiMode":"on-demand-per-turn"
+Health must show:
+  "version":"2.2.0-buffered-response"
+  "responseMode":"buffered-content-length"
 
-Expected idle Railway logs stop after startup. Gemini opens only after Atlas submits a /turn request.
+This version buffers the complete Gemini PCM response on Railway, then sends one fixed-length HTTP body to Atlas.
