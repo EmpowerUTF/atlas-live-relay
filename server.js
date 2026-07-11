@@ -15,11 +15,10 @@ const SYSTEM_INSTRUCTION =
     "If the speech is unclear, say exactly: I didn't catch that. " +
     "Keep routine answers to one or two concise sentences.";
 
-const RELAY_VERSION = "2.3.0-stream-diagnostics";
-const INPUT_FRAME_BYTES = 3200; // 100 ms of 16 kHz mono PCM16
-const MAX_INPUT_BYTES = 192000; // 6 seconds maximum
-const TURN_TIMEOUT_MS = 25000;
-const MAX_OUTPUT_BYTES = 384000; // 8 seconds of 24 kHz mono PCM16
+const RELAY_VERSION = "2.4.0-manual-turn";
+const MAX_INPUT_BYTES = 192000; // 6 s of 16 kHz mono PCM16
+const MAX_OUTPUT_BYTES = 384000; // 8 s of 24 kHz mono PCM16
+const GEMINI_REPLY_TIMEOUT_MS = 20000;
 
 if (!GEMINI_API_KEY) {
   console.error("Missing required environment variable: GEMINI_API_KEY");
@@ -58,7 +57,6 @@ function authorized(parsed) {
 function wavFromPcm(pcm, sampleRate) {
   const header = Buffer.alloc(44);
   const byteRate = sampleRate * 2;
-  const blockAlign = 2;
 
   header.write("RIFF", 0, "ascii");
   header.writeUInt32LE(36 + pcm.length, 4);
@@ -69,7 +67,7 @@ function wavFromPcm(pcm, sampleRate) {
   header.writeUInt16LE(1, 22);
   header.writeUInt32LE(sampleRate, 24);
   header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(2, 32);
   header.writeUInt16LE(16, 34);
   header.write("data", 36, "ascii");
   header.writeUInt32LE(pcm.length, 40);
@@ -113,20 +111,26 @@ function collectRequestBody(req) {
     });
 
     req.on("error", (error) => {
-      fail(Object.assign(new Error(`request_error: ${error.message}`), { status: 400 }));
+      fail(
+        Object.assign(new Error(`request_error: ${error.message}`), {
+          status: 400,
+        }),
+      );
     });
   });
 }
 
-async function openGeminiTurn(res) {
+async function runGeminiTurn(audio, res) {
   let session = null;
   let settled = false;
   let timeout = null;
   let headersSent = false;
   let outputBytes = 0;
-  const outputChunks = [];
+  let firstAudioAt = 0;
   let inputTranscript = "";
   let outputTranscript = "";
+  const outputChunks = [];
+  const turnStartedAt = Date.now();
 
   let resolveDone;
   let rejectDone;
@@ -147,10 +151,8 @@ async function openGeminiTurn(res) {
     if (settled) return;
     settled = true;
 
-    if (timeout) {
-      clearTimeout(timeout);
-      timeout = null;
-    }
+    if (timeout) clearTimeout(timeout);
+    timeout = null;
 
     console.error(`Atlas HTTP turn failed: ${message}`);
 
@@ -166,14 +168,12 @@ async function openGeminiTurn(res) {
     rejectDone(new Error(message));
   };
 
-  const finish = () => {
+  const finish = (reason) => {
     if (settled) return;
     settled = true;
 
-    if (timeout) {
-      clearTimeout(timeout);
-      timeout = null;
-    }
+    if (timeout) clearTimeout(timeout);
+    timeout = null;
 
     if (outputBytes === 0) {
       if (!res.headersSent) {
@@ -186,36 +186,24 @@ async function openGeminiTurn(res) {
       return;
     }
 
-    if (!res.writableEnded) {
-      res.end();
-    }
-
-    const outputPcm = Buffer.concat(outputChunks, outputBytes);
+    if (!res.writableEnded) res.end();
 
     lastTurn = {
       createdAt: new Date().toISOString(),
-      inputPcm: lastTurn.inputPcm,
-      outputPcm,
+      inputPcm: Buffer.from(audio),
+      outputPcm: Buffer.concat(outputChunks, outputBytes),
       inputTranscript: inputTranscript.trim(),
       outputTranscript: outputTranscript.trim(),
     };
 
     console.log(
-      `Atlas HTTP streamed response complete. Output bytes: ${outputBytes}`,
+      `Atlas HTTP response complete (${reason}). Input bytes: ${audio.length}, output bytes: ${outputBytes}, total: ${Date.now() - turnStartedAt} ms`,
     );
-    console.log(
-      `INPUT TRANSCRIPT: ${lastTurn.inputTranscript || "<empty>"}`,
-    );
-    console.log(
-      `OUTPUT TRANSCRIPT: ${lastTurn.outputTranscript || "<empty>"}`,
-    );
+    console.log(`INPUT TRANSCRIPT: ${lastTurn.inputTranscript || "<empty>"}`);
+    console.log(`OUTPUT TRANSCRIPT: ${lastTurn.outputTranscript || "<empty>"}`);
 
     closeSession();
-    resolveDone({
-      outputBytes,
-      inputTranscript: lastTurn.inputTranscript,
-      outputTranscript: lastTurn.outputTranscript,
-    });
+    resolveDone();
   };
 
   res.on("close", () => {
@@ -231,8 +219,10 @@ async function openGeminiTurn(res) {
       systemInstruction: SYSTEM_INSTRUCTION,
       inputAudioTranscription: {},
       outputAudioTranscription: {},
-      thinkingConfig: {
-        thinkingLevel: "minimal",
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          disabled: true,
+        },
       },
       speechConfig: {
         voiceConfig: {
@@ -284,6 +274,11 @@ async function openGeminiTurn(res) {
 
           if (!headersSent) {
             headersSent = true;
+            firstAudioAt = Date.now();
+            console.log(
+              `HTTP turn first Gemini audio after ${firstAudioAt - turnStartedAt} ms.`,
+            );
+
             res.writeHead(200, {
               "content-type": "audio/pcm;rate=24000",
               "cache-control": "no-store",
@@ -295,21 +290,22 @@ async function openGeminiTurn(res) {
 
           outputChunks.push(pcm);
           outputBytes += pcm.length;
-
-          if (!res.write(pcm)) {
-            // Node will resume flushing automatically. The complete output is
-            // still retained for the diagnostic WAV endpoint.
-          }
+          res.write(pcm);
         }
 
+        // generationComplete means every output audio chunk for this turn has
+        // been generated. Ending here avoids waiting for Gemini's simulated
+        // real-time playback delay before turnComplete.
         if (content?.generationComplete) {
           console.log(
-            `HTTP turn Gemini generation complete. Output bytes so far: ${outputBytes}`,
+            `HTTP turn Gemini generation complete. Output bytes: ${outputBytes}`,
           );
+          finish("generationComplete");
+          return;
         }
 
         if (content?.turnComplete) {
-          finish();
+          finish("turnComplete");
         }
       },
 
@@ -332,44 +328,24 @@ async function openGeminiTurn(res) {
 
   console.log("HTTP turn Gemini session ready.");
 
-  timeout = setTimeout(() => {
-    fail(504, "gemini_turn_timeout");
-  }, TURN_TIMEOUT_MS);
-
-  return {
-    async submit(audio) {
-      lastTurn = {
-        createdAt: new Date().toISOString(),
-        inputPcm: Buffer.from(audio),
-        outputPcm: Buffer.alloc(0),
-        inputTranscript: "",
-        outputTranscript: "",
-      };
-
-      for (let offset = 0; offset < audio.length; offset += INPUT_FRAME_BYTES) {
-        const frame = audio.subarray(
-          offset,
-          Math.min(offset + INPUT_FRAME_BYTES, audio.length),
-        );
-
-        session.sendRealtimeInput({
-          audio: {
-            data: frame.toString("base64"),
-            mimeType: "audio/pcm;rate=16000",
-          },
-        });
-
-        if ((offset / INPUT_FRAME_BYTES) % 5 === 4) {
-          await new Promise((resolve) => setImmediate(resolve));
-        }
-      }
-
-      session.sendRealtimeInput({ audioStreamEnd: true });
-      console.log(`Atlas HTTP audio submitted. Input bytes: ${audio.length}`);
+  // This matches Google's documented custom-VAD sequence exactly:
+  // disable automatic VAD, then activityStart -> audio -> activityEnd.
+  session.sendRealtimeInput({ activityStart: {} });
+  session.sendRealtimeInput({
+    audio: {
+      data: audio.toString("base64"),
+      mimeType: "audio/pcm;rate=16000",
     },
-    done,
-    close: closeSession,
-  };
+  });
+  session.sendRealtimeInput({ activityEnd: {} });
+
+  console.log(`Atlas HTTP audio submitted. Input bytes: ${audio.length}`);
+
+  timeout = setTimeout(() => {
+    fail(504, "gemini_reply_timeout");
+  }, GEMINI_REPLY_TIMEOUT_MS);
+
+  await done;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -393,11 +369,10 @@ const server = http.createServer(async (req, res) => {
       model: GEMINI_MODEL,
       voice: ATLAS_VOICE,
       geminiReady: true,
-      geminiMode: "connect-during-upload",
+      geminiMode: "on-demand-manual-vad",
       responseMode: "streamed-chunked",
       inputTranscription: true,
       outputTranscription: true,
-      diagnostics: true,
     });
     return;
   }
@@ -471,35 +446,20 @@ const server = http.createServer(async (req, res) => {
 
     console.log("Atlas HTTP turn request received.");
 
-    let turn = null;
-
     try {
-      // Open Gemini while Atlas is still uploading the microphone turn. This
-      // hides most of the Gemini session startup time behind recording.
-      const turnPromise = openGeminiTurn(res);
-      const audioPromise = collectRequestBody(req);
-      turn = await turnPromise;
-      const audio = await audioPromise;
+      const audio = await collectRequestBody(req);
 
       if (audio.length === 0) {
-        turn.close();
         safeJson(res, 400, { ok: false, error: "empty_audio" });
         return;
       }
 
       console.log(`Atlas HTTP upload received. Bytes: ${audio.length}`);
-      await turn.submit(audio);
-      await turn.done;
+      await runGeminiTurn(audio, res);
     } catch (error) {
       const status = error?.status || 500;
       const message = error?.message || String(error);
       console.error(`Atlas HTTP request failed: ${message}`);
-
-      try {
-        turn?.close();
-      } catch {
-        // Ignore close failures during error cleanup.
-      }
 
       if (!res.headersSent) {
         safeJson(res, status, { ok: false, error: message });
@@ -523,5 +483,5 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`Relay version: ${RELAY_VERSION}`);
   console.log(`Model: ${GEMINI_MODEL}`);
   console.log(`Voice: ${ATLAS_VOICE}`);
-  console.log("Gemini connects while Atlas uploads each voice turn.");
+  console.log("Gemini sessions open only after Atlas finishes uploading a turn.");
 });
