@@ -5,7 +5,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const RELAY_VERSION = "3.1.5";
+const RELAY_VERSION = "3.1.4";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ATLAS_DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const GEMINI_PRIMARY_MODEL =
@@ -14,7 +14,7 @@ const GEMINI_FALLBACK_MODEL =
   process.env.GEMINI_FALLBACK_MODEL ||
   "gemini-2.5-flash-native-audio-preview-12-2025";
 const GEMINI_RETRY_DELAY_MS = 1500;
-const ATLAS_VOICE = "Gacrux";
+const ATLAS_VOICE = "Charon";
 const BASE_SYSTEM_INSTRUCTION =
   process.env.ATLAS_SYSTEM_INSTRUCTION ||
   "You are Atlas, a fast, practical AI companion. Speak naturally and directly. " +
@@ -24,12 +24,11 @@ const LANGUAGE_AND_VOICE_LOCK =
   "LANGUAGE AND VOICE REQUIREMENT: Always speak in English only. " +
   "Never answer in Spanish or any other language, even if automatic transcription " +
   "mistakenly labels the owner's English speech as another language. " +
-  "Use the Gacrux voice as an articulate adult British man with cultivated, " +
-  "contemporary Received Pronunciation: sophisticated, calm, intelligent, warm, " +
-  "and natural. Maintain one even conversational pace from the first word to the " +
-  "last; do not accelerate, decelerate, become theatrical, or exaggerate class " +
-  "markers. Avoid American pronunciation and vocal fry. If the owner's request is " +
-  "not intelligible, ask briefly for repetition rather than inventing a topic. " +
+  "Speak as an articulate adult British man using cultivated modern Received " +
+  "Pronunciation: sophisticated, measured, intelligent, warm, and natural. " +
+  "Avoid American pronunciation, exaggerated aristocratic affectation, theatrical " +
+  "delivery, rushed speech, and vocal fry. Use clean phrasing and an even pace. " +
+  "Do not imitate the language or accent inferred from noisy audio. " +
   "Only change language if the owner explicitly says the exact words: switch language.";
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
@@ -40,7 +39,7 @@ const MAX_ATLAS_MESSAGE_BYTES = 64 * 1024;
 const PCM_SLICE_BYTES = 1920; // 40 ms of 24 kHz mono PCM16.
 const PCM_SLICE_MS = 40;
 const PCM_START_BUFFER_BYTES = 14_400; // 300 ms before first downlink frame.
-const ATLAS_BACKPRESSURE_BYTES = 16 * 1024;
+const ATLAS_BACKPRESSURE_BYTES = 128 * 1024;
 const SESSION_HANDLE_MAX_AGE_MS = 90 * 60 * 1000;
 const RECENT_HISTORY_TURNS = 4;
 const TRANSCRIPT_SETTLE_MS = 450;
@@ -350,6 +349,7 @@ class PcmPacer {
     this.onDrained = onDrained;
     this.queue = new PcmChunkQueue();
     this.timer = null;
+    this.sending = false;
     this.done = false;
     this.closed = false;
     this.started = false;
@@ -357,7 +357,6 @@ class PcmPacer {
     this.lateTicks = 0;
     this.maxLateMs = 0;
     this.backpressureWaits = 0;
-    this.framesSent = 0;
   }
 
   enqueue(pcm) {
@@ -366,6 +365,7 @@ class PcmPacer {
 
     if (
       !this.timer &&
+      !this.sending &&
       (this.started ||
        this.done ||
        this.queue.length >= PCM_START_BUFFER_BYTES)
@@ -376,7 +376,7 @@ class PcmPacer {
 
   markDone() {
     this.done = true;
-    if (!this.timer) this.schedule(0);
+    if (!this.timer && !this.sending) this.schedule(0);
   }
 
   clear() {
@@ -384,16 +384,17 @@ class PcmPacer {
     this.queue.clear();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    this.sending = false;
   }
 
   schedule(delay) {
-    if (this.closed || this.timer) return;
+    if (this.closed || this.timer || this.sending) return;
     this.timer = setTimeout(() => this.tick(), Math.max(0, delay));
   }
 
   tick() {
     this.timer = null;
-    if (this.closed) return;
+    if (this.closed || this.sending) return;
 
     if (this.atlas.readyState !== WebSocket.OPEN) {
       this.clear();
@@ -408,7 +409,7 @@ class PcmPacer {
 
     if (this.atlas.bufferedAmount > ATLAS_BACKPRESSURE_BYTES) {
       this.backpressureWaits++;
-      this.schedule(4);
+      this.schedule(5);
       return;
     }
 
@@ -422,32 +423,33 @@ class PcmPacer {
         this.maxLateMs = Math.max(this.maxLateMs, lateMs);
       }
 
-      // Maintain an absolute 40 ms clock. Do not wait for the ws callback:
-      // callback latency is not audio time and previously made speech audibly
-      // slow down, then catch up. bufferedAmount is the correct flow control.
+      if (this.nextSendAt < now - PCM_SLICE_MS * 2) {
+        this.nextSendAt = now;
+      }
+
+      // Exactly one 40 ms PCM frame may be in flight. The previous build could
+      // schedule another tick while a ws send callback was still pending,
+      // producing bursty delivery and audible breakup.
+      this.sending = true;
       try {
         this.atlas.send(slice, { binary: true }, (error) => {
-          if (error && !this.closed) {
+          this.sending = false;
+          if (this.closed) return;
+
+          if (error) {
             console.error("Atlas PCM send failed:", error.message);
             this.clear();
+            return;
           }
+
+          this.nextSendAt += PCM_SLICE_MS;
+          this.schedule(Math.max(0, this.nextSendAt - Date.now()));
         });
       } catch (error) {
+        this.sending = false;
         console.error("Atlas PCM send threw:", error.message);
         this.clear();
-        return;
       }
-
-      this.framesSent++;
-      this.nextSendAt += PCM_SLICE_MS;
-
-      // If Railway's event loop was paused for a long time, discard only the
-      // scheduler debt; never alter or drop PCM samples.
-      if (this.nextSendAt < Date.now() - PCM_SLICE_MS * 3) {
-        this.nextSendAt = Date.now();
-      }
-
-      this.schedule(Math.max(0, this.nextSendAt - Date.now()));
       return;
     }
 
@@ -459,16 +461,18 @@ class PcmPacer {
         if (this.closed) return;
         this.closed = true;
         console.log(
-          `PCM pacing complete: frames=${this.framesSent} ` +
-            `lateTicks=${this.lateTicks} maxLateMs=${this.maxLateMs} ` +
+          `PCM pacing complete: lateTicks=${this.lateTicks} ` +
+            `maxLateMs=${this.maxLateMs} ` +
             `backpressureWaits=${this.backpressureWaits}`,
         );
         this.onDrained();
       };
 
       if (tail?.length) {
+        this.sending = true;
         try {
           this.atlas.send(tail, { binary: true }, (error) => {
+            this.sending = false;
             if (error) {
               console.error("Atlas final PCM send failed:", error.message);
               this.clear();
@@ -477,6 +481,7 @@ class PcmPacer {
             complete();
           });
         } catch (error) {
+          this.sending = false;
           console.error("Atlas final PCM send threw:", error.message);
           this.clear();
         }
@@ -486,7 +491,9 @@ class PcmPacer {
       return;
     }
 
-    this.schedule(3);
+    // Gemini has not produced another complete frame yet. Do not send silence
+    // or partial PCM; preserve the audio clock and poll briefly.
+    this.schedule(4);
   }
 }
 
@@ -685,7 +692,6 @@ atlasWss.on("connection", (atlas, req) => {
       firstAudioLatencyMs: 0,
       totalTurnMs: 0,
       usage: {},
-      outputMimeType: "",
       active: true,
     };
   };
@@ -870,13 +876,6 @@ atlasWss.on("connection", (atlas, req) => {
 
         const pcm = Buffer.from(inline.data, "base64");
         if (!currentTurn) resetTurn();
-
-        if (!currentTurn.outputMimeType) {
-          currentTurn.outputMimeType = inline.mimeType || "audio/pcm";
-          console.log(
-            `[${deviceId}] Gemini output format: ${currentTurn.outputMimeType}`,
-          );
-        }
 
         if (!currentTurn.firstAudioLatencyMs) {
           currentTurn.firstAudioLatencyMs =
