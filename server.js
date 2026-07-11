@@ -5,7 +5,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const RELAY_VERSION = "3.1.3";
+const RELAY_VERSION = "3.1.4";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ATLAS_DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const GEMINI_PRIMARY_MODEL =
@@ -38,10 +38,10 @@ const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 const MAX_ATLAS_MESSAGE_BYTES = 64 * 1024;
 const PCM_SLICE_BYTES = 1920; // 40 ms of 24 kHz mono PCM16.
 const PCM_SLICE_MS = 40;
-const PCM_START_BUFFER_BYTES = 19_200; // 400 ms before first downlink frame.
+const PCM_START_BUFFER_BYTES = 14_400; // 300 ms before first downlink frame.
 const ATLAS_BACKPRESSURE_BYTES = 128 * 1024;
 const SESSION_HANDLE_MAX_AGE_MS = 90 * 60 * 1000;
-const RECENT_HISTORY_TURNS = 10;
+const RECENT_HISTORY_TURNS = 4;
 const TRANSCRIPT_SETTLE_MS = 450;
 
 if (!GEMINI_API_KEY) {
@@ -233,27 +233,40 @@ async function saveTurn(turn) {
 }
 
 function buildSystemInstruction(memories, recentTurns = []) {
-  let instruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${LANGUAGE_AND_VOICE_LOCK}`;
+  let instruction =
+    `${BASE_SYSTEM_INSTRUCTION}\n\n${LANGUAGE_AND_VOICE_LOCK}` +
+    "\n\nCURRENT TURN RULES: The owner's current live spoken request is authoritative. " +
+    "Answer that request directly before using prior context. Never answer an older " +
+    "saved question instead of the current one. If the current speech is unclear or " +
+    "internally inconsistent, briefly ask the owner to repeat it rather than guessing.";
 
   if (memories.length) {
     const memoryLines = memories.map((item) => `- ${item.content}`).join("\n");
     instruction +=
       "\n\nDurable owner memory supplied by Atlas storage. " +
-      "Use it only when relevant; do not mention the storage system:\n" +
+      "Use it only when clearly relevant; do not mention the storage system:\n" +
       memoryLines;
   }
 
-  if (recentTurns.length) {
+  const cleanRecentTurns = recentTurns
+    .filter((turn) =>
+      typeof turn.user_text === "string" &&
+      typeof turn.atlas_text === "string" &&
+      turn.user_text.trim().length >= 3 &&
+      turn.atlas_text.trim().length >= 3
+    )
+    .slice(-2);
+
+  if (cleanRecentTurns.length) {
     const recentLines = [];
-    for (const turn of recentTurns.slice(-6)) {
-      if (turn.user_text) recentLines.push(`Owner: ${turn.user_text}`);
-      if (turn.atlas_text) recentLines.push(`Atlas: ${turn.atlas_text}`);
+    for (const turn of cleanRecentTurns) {
+      recentLines.push(`Owner: ${turn.user_text.trim()}`);
+      recentLines.push(`Atlas: ${turn.atlas_text.trim()}`);
     }
-    if (recentLines.length) {
-      instruction +=
-        "\n\nRecent saved conversation context. Continue naturally when relevant:\n" +
-        recentLines.join("\n");
-    }
+    instruction +=
+      "\n\nLimited reconnect context only. Use it solely when the current request " +
+      "clearly refers back to it:\n" +
+      recentLines.join("\n");
   }
 
   return instruction;
@@ -296,7 +309,7 @@ class PcmChunkQueue {
       const head = this.chunks[0];
       const available = head.length - this.headOffset;
       const wanted = byteCount - outputOffset;
-      const copyCount = available < wanted ? available : wanted;
+      const copyCount = Math.min(available, wanted);
 
       head.copy(
         output,
@@ -320,8 +333,7 @@ class PcmChunkQueue {
 
   takeAllEven() {
     const evenLength = this.length & ~1;
-    if (!evenLength) return null;
-    return this.take(evenLength);
+    return evenLength ? this.take(evenLength) : null;
   }
 
   clear() {
@@ -337,6 +349,7 @@ class PcmPacer {
     this.onDrained = onDrained;
     this.queue = new PcmChunkQueue();
     this.timer = null;
+    this.sending = false;
     this.done = false;
     this.closed = false;
     this.started = false;
@@ -350,20 +363,20 @@ class PcmPacer {
     if (this.closed || !pcm?.length) return;
     this.queue.push(pcm);
 
-    // Keep a modest reserve before playback starts. PCM is held as chunks
-    // instead of repeatedly Buffer.concat-ing the whole response, avoiding
-    // growing copies and garbage-collection pauses during speech.
-    if (!this.timer &&
-        (this.started ||
-         this.done ||
-         this.queue.length >= PCM_START_BUFFER_BYTES)) {
+    if (
+      !this.timer &&
+      !this.sending &&
+      (this.started ||
+       this.done ||
+       this.queue.length >= PCM_START_BUFFER_BYTES)
+    ) {
       this.schedule(0);
     }
   }
 
   markDone() {
     this.done = true;
-    if (!this.timer) this.schedule(0);
+    if (!this.timer && !this.sending) this.schedule(0);
   }
 
   clear() {
@@ -371,16 +384,17 @@ class PcmPacer {
     this.queue.clear();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    this.sending = false;
   }
 
   schedule(delay) {
-    if (this.closed || this.timer) return;
+    if (this.closed || this.timer || this.sending) return;
     this.timer = setTimeout(() => this.tick(), Math.max(0, delay));
   }
 
   tick() {
     this.timer = null;
-    if (this.closed) return;
+    if (this.closed || this.sending) return;
 
     if (this.atlas.readyState !== WebSocket.OPEN) {
       this.clear();
@@ -388,16 +402,14 @@ class PcmPacer {
     }
 
     if (!this.started) {
-      if (!this.done && this.queue.length < PCM_START_BUFFER_BYTES) {
-        return;
-      }
+      if (!this.done && this.queue.length < PCM_START_BUFFER_BYTES) return;
       this.started = true;
       this.nextSendAt = Date.now();
     }
 
     if (this.atlas.bufferedAmount > ATLAS_BACKPRESSURE_BYTES) {
       this.backpressureWaits++;
-      this.schedule(4);
+      this.schedule(5);
       return;
     }
 
@@ -408,32 +420,36 @@ class PcmPacer {
 
       if (lateMs > 3) {
         this.lateTicks++;
-        if (lateMs > this.maxLateMs) this.maxLateMs = lateMs;
+        this.maxLateMs = Math.max(this.maxLateMs, lateMs);
       }
 
-      // If the event loop was briefly delayed, reset only after a severe lag.
-      // Ordinary timer jitter is absorbed by the relay and ESP32 reserves.
-      if (this.nextSendAt < now - PCM_SLICE_MS * 4) {
+      if (this.nextSendAt < now - PCM_SLICE_MS * 2) {
         this.nextSendAt = now;
       }
 
+      // Exactly one 40 ms PCM frame may be in flight. The previous build could
+      // schedule another tick while a ws send callback was still pending,
+      // producing bursty delivery and audible breakup.
+      this.sending = true;
       try {
-        // Do not serialize the audio clock behind ws send callbacks. ws queues
-        // this frame immediately; bufferedAmount supplies backpressure.
         this.atlas.send(slice, { binary: true }, (error) => {
-          if (error && !this.closed) {
+          this.sending = false;
+          if (this.closed) return;
+
+          if (error) {
             console.error("Atlas PCM send failed:", error.message);
             this.clear();
+            return;
           }
+
+          this.nextSendAt += PCM_SLICE_MS;
+          this.schedule(Math.max(0, this.nextSendAt - Date.now()));
         });
       } catch (error) {
+        this.sending = false;
         console.error("Atlas PCM send threw:", error.message);
         this.clear();
-        return;
       }
-
-      this.nextSendAt += PCM_SLICE_MS;
-      this.schedule(Math.max(0, this.nextSendAt - Date.now()));
       return;
     }
 
@@ -453,23 +469,31 @@ class PcmPacer {
       };
 
       if (tail?.length) {
-        this.atlas.send(tail, { binary: true }, (error) => {
-          if (error) {
-            console.error("Atlas final PCM send failed:", error.message);
-            this.clear();
-            return;
-          }
-          complete();
-        });
+        this.sending = true;
+        try {
+          this.atlas.send(tail, { binary: true }, (error) => {
+            this.sending = false;
+            if (error) {
+              console.error("Atlas final PCM send failed:", error.message);
+              this.clear();
+              return;
+            }
+            complete();
+          });
+        } catch (error) {
+          this.sending = false;
+          console.error("Atlas final PCM send threw:", error.message);
+          this.clear();
+        }
       } else {
         complete();
       }
       return;
     }
 
-    // Gemini has not produced another full slice yet. Poll without advancing
-    // the audio clock; both ends retain enough PCM to absorb ordinary jitter.
-    this.schedule(3);
+    // Gemini has not produced another complete frame yet. Do not send silence
+    // or partial PCM; preserve the audio clock and poll briefly.
+    this.schedule(4);
   }
 }
 
@@ -493,8 +517,10 @@ const server = http.createServer(async (req, res) => {
       mode: "continuous-live-pcm-official-genai-sdk",
       geminiTransport: "official-google-genai-sdk",
       uplink: "20ms-live-pcm",
-      downlink: "40ms-clocked-pcm-with-400ms-jitter-buffer",
+      downlink: "40ms-callback-serialized-pcm-with-300ms-jitter-buffer",
       transportHeartbeat: "activity-aware-120s-stale-timeout",
+      sessionRotation: "deferred-until-idle",
+      reconnectContext: "last-2-complete-turns",
       durableMemory: SUPABASE_ENABLED,
     });
     return;
@@ -638,6 +664,8 @@ atlasWss.on("connection", (atlas, req) => {
   let geminiRetryTimer = null;
   let atlasLastSeenAt = Date.now();
   let atlasTransportHeartbeat = null;
+  let pendingGeminiRotation = null;
+  let geminiRotationTimer = null;
 
   const geminiModels = [...new Set(
     [GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL].filter(Boolean),
@@ -666,6 +694,42 @@ atlasWss.on("connection", (atlas, req) => {
       usage: {},
       active: true,
     };
+  };
+
+  const rotateGeminiWhenIdle = () => {
+    if (closed || !pendingGeminiRotation) return;
+
+    const turnActive = Boolean(currentTurn?.active);
+    const audioStillDraining = Boolean(pacer && !pacer.closed);
+    if (turnActive || audioStillDraining) return;
+
+    const reason = pendingGeminiRotation.reason || "gemini_go_away";
+    pendingGeminiRotation = null;
+
+    if (geminiRotationTimer) clearTimeout(geminiRotationTimer);
+    geminiRotationTimer = null;
+
+    sendAtlasJson({
+      type: "session_reconnecting",
+      reason,
+    });
+    closeGeminiSession();
+    scheduleGeminiConnect(0, 500, reason);
+  };
+
+  const requestGeminiRotation = (detail) => {
+    pendingGeminiRotation = {
+      reason: "gemini_session_rotation",
+      detail,
+      requestedAt: Date.now(),
+    };
+
+    // GoAway is advance notice, not an instruction to kill an active turn.
+    // Rotate immediately only while idle; otherwise finish the current reply.
+    if (!currentTurn?.active && (!pacer || pacer.closed)) {
+      if (geminiRotationTimer) clearTimeout(geminiRotationTimer);
+      geminiRotationTimer = setTimeout(rotateGeminiWhenIdle, 250);
+    }
   };
 
   const finishTurn = () => {
@@ -700,6 +764,10 @@ atlasWss.on("connection", (atlas, req) => {
         console.error("Save turn failed:", error.message),
       );
     }, TRANSCRIPT_SETTLE_MS);
+
+    // If Gemini announced a future session close during this turn, rotate only
+    // after the response has completely drained and the turn is saved.
+    setTimeout(rotateGeminiWhenIdle, 0);
   };
 
   const closeGeminiSession = () => {
@@ -727,6 +795,9 @@ atlasWss.on("connection", (atlas, req) => {
     geminiRetryTimer = null;
     if (atlasTransportHeartbeat) clearInterval(atlasTransportHeartbeat);
     atlasTransportHeartbeat = null;
+    if (geminiRotationTimer) clearTimeout(geminiRotationTimer);
+    geminiRotationTimer = null;
+    pendingGeminiRotation = null;
 
     pacer?.clear();
     pacer = null;
@@ -849,19 +920,10 @@ atlasWss.on("connection", (atlas, req) => {
     if (message.goAway) {
       console.log(
         `[${deviceId}] Gemini requested session rotation ` +
-          `model=${activeGeminiModel}.`,
+          `model=${activeGeminiModel}; deferring until idle.`,
       );
       sendAtlasJson({ type: "go_away", detail: message.goAway });
-
-      setTimeout(() => {
-        if (
-          !closed &&
-          connectionSerial === geminiConnectionSerial
-        ) {
-          closeGeminiSession();
-          scheduleGeminiConnect(0, 500, "Gemini session rotation");
-        }
-      }, 250);
+      requestGeminiRotation(message.goAway);
     }
   };
 
@@ -1010,6 +1072,9 @@ atlasWss.on("connection", (atlas, req) => {
       geminiSession = session;
       geminiConnecting = false;
       geminiReady = true;
+      pendingGeminiRotation = null;
+      if (geminiRotationTimer) clearTimeout(geminiRotationTimer);
+      geminiRotationTimer = null;
 
       sendAtlasJson({
         type: "ready",
@@ -1187,7 +1252,12 @@ atlasWss.on("connection", (atlas, req) => {
         loadMemories(deviceId),
       ]);
 
-      recentTurns = turns;
+      recentTurns = turns.filter((turn) =>
+        typeof turn.user_text === "string" &&
+        typeof turn.atlas_text === "string" &&
+        turn.user_text.trim().length >= 3 &&
+        turn.atlas_text.trim().length >= 3
+      ).slice(-2);
       memories = storedMemories;
 
       // Old raw-WebSocket session handles are deliberately cleared. Durable
