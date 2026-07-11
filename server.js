@@ -5,7 +5,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const RELAY_VERSION = "3.0.4";
+const RELAY_VERSION = "3.1.0";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ATLAS_DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const GEMINI_PRIMARY_MODEL =
@@ -25,8 +25,9 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 
 const MAX_ATLAS_MESSAGE_BYTES = 64 * 1024;
-const PCM_SLICE_BYTES = 960; // 20 ms of 24 kHz mono PCM16.
-const PCM_SLICE_MS = 20;
+const PCM_SLICE_BYTES = 3840; // 80 ms of 24 kHz mono PCM16.
+const PCM_SLICE_MS = 80;
+const ATLAS_BACKPRESSURE_BYTES = 96 * 1024;
 const SESSION_HANDLE_MAX_AGE_MS = 90 * 60 * 1000;
 const RECENT_HISTORY_TURNS = 10;
 const TRANSCRIPT_SETTLE_MS = 450;
@@ -298,27 +299,59 @@ class PcmPacer {
     this.timer = null;
     if (this.closed) return;
 
+    if (this.atlas.readyState !== WebSocket.OPEN) {
+      this.clear();
+      return;
+    }
+
+    // Do not pile audio into Railway/ESP32 socket buffers. A larger 80 ms
+    // frame is much less sensitive to Node timer jitter than the old 20 ms
+    // frame, while bufferedAmount protects the small ESP32 receiver.
+    if (this.atlas.bufferedAmount > ATLAS_BACKPRESSURE_BYTES) {
+      this.schedule(10);
+      return;
+    }
+
     if (this.buffer.length >= PCM_SLICE_BYTES) {
-      const slice = this.buffer.subarray(0, PCM_SLICE_BYTES);
+      const slice = Buffer.from(this.buffer.subarray(0, PCM_SLICE_BYTES));
       this.buffer = this.buffer.subarray(PCM_SLICE_BYTES);
-      if (this.atlas.readyState === WebSocket.OPEN) {
-        this.atlas.send(slice, { binary: true });
-      }
-      this.schedule(PCM_SLICE_MS);
+      this.atlas.send(slice, { binary: true }, (error) => {
+        if (error) {
+          console.error("Atlas PCM send failed:", error.message);
+          this.clear();
+          return;
+        }
+        this.schedule(PCM_SLICE_MS);
+      });
       return;
     }
 
     if (this.done) {
-      if (this.buffer.length && this.atlas.readyState === WebSocket.OPEN) {
-        this.atlas.send(this.buffer, { binary: true });
-      }
+      const tail = this.buffer.length ? Buffer.from(this.buffer) : null;
       this.buffer = Buffer.alloc(0);
-      this.closed = true;
-      this.onDrained();
+
+      const complete = () => {
+        if (this.closed) return;
+        this.closed = true;
+        this.onDrained();
+      };
+
+      if (tail?.length) {
+        this.atlas.send(tail, { binary: true }, (error) => {
+          if (error) {
+            console.error("Atlas final PCM send failed:", error.message);
+            this.clear();
+            return;
+          }
+          complete();
+        });
+      } else {
+        complete();
+      }
       return;
     }
 
-    this.schedule(5);
+    this.schedule(10);
   }
 }
 
@@ -339,8 +372,10 @@ const server = http.createServer(async (req, res) => {
       model: GEMINI_PRIMARY_MODEL,
       fallbackModel: GEMINI_FALLBACK_MODEL,
       voice: ATLAS_VOICE,
-      mode: "persistent-websocket-official-genai-sdk",
+      mode: "continuous-live-pcm-official-genai-sdk",
       geminiTransport: "official-google-genai-sdk",
+      uplink: "20ms-live-pcm",
+      downlink: "80ms-buffered-pcm",
       durableMemory: SUPABASE_ENABLED,
     });
     return;
@@ -500,6 +535,7 @@ atlasWss.on("connection", (atlas, req) => {
       conversationId,
       turnIndex: ++turnCounter,
       startedAt: Date.now(),
+      activityEndedAt: 0,
       inputTranscript: "",
       outputTranscript: "",
       inputBytes: 0,
@@ -649,7 +685,7 @@ atlasWss.on("connection", (atlas, req) => {
 
         if (!currentTurn.firstAudioLatencyMs) {
           currentTurn.firstAudioLatencyMs =
-            Date.now() - currentTurn.startedAt;
+            Date.now() - (currentTurn.activityEndedAt || currentTurn.startedAt);
           sendAtlasJson({
             type: "response_start",
             latencyMs: currentTurn.firstAudioLatencyMs,
@@ -948,6 +984,7 @@ atlasWss.on("connection", (atlas, req) => {
       }
     } else if (control.type === "activity_end") {
       if (currentTurn?.active) {
+        currentTurn.activityEndedAt = Date.now();
         try {
           geminiSession.sendRealtimeInput({ activityEnd: {} });
           sendAtlasJson({
