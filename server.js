@@ -5,7 +5,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const RELAY_VERSION = "3.1.0";
+const RELAY_VERSION = "3.1.1";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ATLAS_DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const GEMINI_PRIMARY_MODEL =
@@ -14,20 +14,29 @@ const GEMINI_FALLBACK_MODEL =
   process.env.GEMINI_FALLBACK_MODEL ||
   "gemini-2.5-flash-native-audio-preview-12-2025";
 const GEMINI_RETRY_DELAY_MS = 1500;
-const ATLAS_VOICE = process.env.ATLAS_VOICE || "Kore";
+const ATLAS_VOICE = "Orus";
 const BASE_SYSTEM_INSTRUCTION =
   process.env.ATLAS_SYSTEM_INSTRUCTION ||
   "You are Atlas, a fast, practical AI companion. Speak naturally and directly. " +
     "Keep routine replies concise. Ask one useful follow-up only when it is genuinely needed.";
+
+const LANGUAGE_AND_VOICE_LOCK =
+  "LANGUAGE AND VOICE REQUIREMENT: Always speak in English only. " +
+  "Never answer in Spanish or any other language, even if automatic transcription " +
+  "mistakenly labels the owner's English speech as another language. " +
+  "Use a natural adult male voice with a clear, neutral American English accent. " +
+  "Do not imitate the language or accent inferred from noisy audio. " +
+  "Only change language if the owner explicitly says the exact words: switch language.";
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 
 const MAX_ATLAS_MESSAGE_BYTES = 64 * 1024;
-const PCM_SLICE_BYTES = 3840; // 80 ms of 24 kHz mono PCM16.
-const PCM_SLICE_MS = 80;
-const ATLAS_BACKPRESSURE_BYTES = 96 * 1024;
+const PCM_SLICE_BYTES = 1920; // 40 ms of 24 kHz mono PCM16.
+const PCM_SLICE_MS = 40;
+const PCM_START_BUFFER_BYTES = 14_400; // 300 ms before first downlink frame.
+const ATLAS_BACKPRESSURE_BYTES = 128 * 1024;
 const SESSION_HANDLE_MAX_AGE_MS = 90 * 60 * 1000;
 const RECENT_HISTORY_TURNS = 10;
 const TRANSCRIPT_SETTLE_MS = 450;
@@ -221,7 +230,7 @@ async function saveTurn(turn) {
 }
 
 function buildSystemInstruction(memories, recentTurns = []) {
-  let instruction = BASE_SYSTEM_INSTRUCTION;
+  let instruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${LANGUAGE_AND_VOICE_LOCK}`;
 
   if (memories.length) {
     const memoryLines = memories.map((item) => `- ${item.content}`).join("\n");
@@ -268,6 +277,8 @@ class PcmPacer {
     this.timer = null;
     this.done = false;
     this.closed = false;
+    this.started = false;
+    this.nextSendAt = 0;
   }
 
   enqueue(pcm) {
@@ -275,7 +286,16 @@ class PcmPacer {
     this.buffer = this.buffer.length
       ? Buffer.concat([this.buffer, pcm])
       : Buffer.from(pcm);
-    if (!this.timer) this.schedule(0);
+
+    // Build a real jitter reserve before starting. The prior relay began after
+    // only 80 ms and then scheduled each next packet 80 ms after the previous
+    // send callback, so callback delay accumulated until the ESP32 starved.
+    if (!this.timer &&
+        (this.started ||
+         this.done ||
+         this.buffer.length >= PCM_START_BUFFER_BYTES)) {
+      this.schedule(0);
+    }
   }
 
   markDone() {
@@ -291,8 +311,8 @@ class PcmPacer {
   }
 
   schedule(delay) {
-    if (this.closed) return;
-    this.timer = setTimeout(() => this.tick(), delay);
+    if (this.closed || this.timer) return;
+    this.timer = setTimeout(() => this.tick(), Math.max(0, delay));
   }
 
   tick() {
@@ -304,30 +324,48 @@ class PcmPacer {
       return;
     }
 
-    // Do not pile audio into Railway/ESP32 socket buffers. A larger 80 ms
-    // frame is much less sensitive to Node timer jitter than the old 20 ms
-    // frame, while bufferedAmount protects the small ESP32 receiver.
+    if (!this.started) {
+      if (!this.done && this.buffer.length < PCM_START_BUFFER_BYTES) {
+        return;
+      }
+      this.started = true;
+      this.nextSendAt = Date.now();
+    }
+
     if (this.atlas.bufferedAmount > ATLAS_BACKPRESSURE_BYTES) {
-      this.schedule(10);
+      this.schedule(5);
       return;
     }
 
     if (this.buffer.length >= PCM_SLICE_BYTES) {
       const slice = Buffer.from(this.buffer.subarray(0, PCM_SLICE_BYTES));
       this.buffer = this.buffer.subarray(PCM_SLICE_BYTES);
+
+      // Use an absolute audio clock. This prevents WebSocket callback latency
+      // from being added to every 40 ms interval.
+      const now = Date.now();
+      if (this.nextSendAt < now - PCM_SLICE_MS * 2) {
+        this.nextSendAt = now;
+      }
+
       this.atlas.send(slice, { binary: true }, (error) => {
         if (error) {
           console.error("Atlas PCM send failed:", error.message);
           this.clear();
           return;
         }
-        this.schedule(PCM_SLICE_MS);
+
+        this.nextSendAt += PCM_SLICE_MS;
+        this.schedule(Math.max(0, this.nextSendAt - Date.now()));
       });
       return;
     }
 
     if (this.done) {
-      const tail = this.buffer.length ? Buffer.from(this.buffer) : null;
+      const tailLength = this.buffer.length & ~1;
+      const tail = tailLength
+        ? Buffer.from(this.buffer.subarray(0, tailLength))
+        : null;
       this.buffer = Buffer.alloc(0);
 
       const complete = () => {
@@ -351,10 +389,11 @@ class PcmPacer {
       return;
     }
 
-    this.schedule(10);
+    // Gemini has not produced another full slice yet. Poll briefly without
+    // advancing the audio clock; the ESP32 still has the 300 ms reserve.
+    this.schedule(4);
   }
 }
-
 const server = http.createServer(async (req, res) => {
   let parsed;
   try {
@@ -375,7 +414,7 @@ const server = http.createServer(async (req, res) => {
       mode: "continuous-live-pcm-official-genai-sdk",
       geminiTransport: "official-google-genai-sdk",
       uplink: "20ms-live-pcm",
-      downlink: "80ms-buffered-pcm",
+      downlink: "40ms-clocked-pcm-with-300ms-jitter-buffer",
       durableMemory: SUPABASE_ENABLED,
     });
     return;
@@ -517,6 +556,8 @@ atlasWss.on("connection", (atlas, req) => {
   let activeModelIndex = 0;
   let geminiConnectionSerial = 0;
   let geminiRetryTimer = null;
+  let atlasTransportAlive = true;
+  let atlasTransportHeartbeat = null;
 
   const geminiModels = [...new Set(
     [GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL].filter(Boolean),
@@ -604,6 +645,8 @@ atlasWss.on("connection", (atlas, req) => {
 
     if (geminiRetryTimer) clearTimeout(geminiRetryTimer);
     geminiRetryTimer = null;
+    if (atlasTransportHeartbeat) clearInterval(atlasTransportHeartbeat);
+    atlasTransportHeartbeat = null;
 
     pacer?.clear();
     pacer = null;
@@ -783,6 +826,7 @@ atlasWss.on("connection", (atlas, req) => {
 
     const config = {
       responseModalities: [Modality.AUDIO],
+      thinkingConfig: { thinkingLevel: "minimal" },
       speechConfig: {
         voiceConfig: {
           prebuiltVoiceConfig: {
@@ -857,6 +901,11 @@ atlasWss.on("connection", (atlas, req) => {
             // when a previously established session later ends.
             if (!wasReady) return;
 
+            sendAtlasJson({
+              type: "session_reconnecting",
+              reason: "gemini_session_closed",
+              code,
+            });
             scheduleGeminiConnect(
               0,
               GEMINI_RETRY_DELAY_MS,
@@ -936,9 +985,8 @@ atlasWss.on("connection", (atlas, req) => {
   };
 
   atlas.on("message", (data, isBinary) => {
-    if (!geminiReady || !geminiSession) return;
-
     if (isBinary) {
+      if (!geminiReady || !geminiSession) return;
       if (!currentTurn?.active) return;
 
       const audio = Buffer.from(data);
@@ -963,6 +1011,19 @@ atlasWss.on("connection", (atlas, req) => {
     try {
       control = JSON.parse(data.toString());
     } catch {
+      return;
+    }
+
+    if (control.type === "ping") {
+      sendAtlasJson({ type: "pong", at: Date.now() });
+      return;
+    }
+
+    if (!geminiReady || !geminiSession) {
+      sendAtlasJson({
+        type: "session_reconnecting",
+        reason: "gemini_not_ready",
+      });
       return;
     }
 
@@ -997,10 +1058,33 @@ atlasWss.on("connection", (atlas, req) => {
           );
         }
       }
-    } else if (control.type === "ping") {
-      sendAtlasJson({ type: "pong", at: Date.now() });
     }
   });
+
+
+  // Keep the Railway edge and ESP32 WebSocket alive independently of Gemini.
+  // This is transport-level ping/pong, so a Gemini session rotation cannot
+  // make Atlas lose its relay socket.
+  atlas.on("pong", () => {
+    atlasTransportAlive = true;
+  });
+
+  atlasTransportHeartbeat = setInterval(() => {
+    if (closed || atlas.readyState !== WebSocket.OPEN) return;
+
+    if (!atlasTransportAlive) {
+      console.warn(`[${deviceId}] Atlas transport heartbeat missed; terminating stale socket.`);
+      atlas.terminate();
+      return;
+    }
+
+    atlasTransportAlive = false;
+    try {
+      atlas.ping();
+    } catch (error) {
+      console.error(`[${deviceId}] Atlas ping failed: ${error.message}`);
+    }
+  }, 20_000);
 
   atlas.on("error", (error) => {
     console.error(`[${deviceId}] Atlas socket error:`, error.message);
