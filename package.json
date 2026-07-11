@@ -1,9 +1,9 @@
 {
   "name": "atlas-live-relay",
-  "version": "1.4.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Low-latency relay between Atlas ESP32 and Gemini Live API",
+  "description": "Stable HTTP turn relay between Atlas ESP32 and Gemini Live API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
