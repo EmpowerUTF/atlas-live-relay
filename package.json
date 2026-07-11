@@ -1,18 +1,16 @@
 {
   "name": "atlas-live-relay",
-  "version": "2.0.0",
+  "version": "3.0.1",
   "private": true,
   "type": "module",
-  "description": "Stable HTTP turn relay between Atlas ESP32 and Gemini Live API",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
   "engines": {
     "node": ">=20"
   },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
   "dependencies": {
-    "@google/genai": "latest",
-    "ws": "^8.18.3"
+    "ws": "8.18.3"
   }
 }
