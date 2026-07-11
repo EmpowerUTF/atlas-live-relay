@@ -5,7 +5,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const RELAY_VERSION = "3.0.3";
+const RELAY_VERSION = "3.0.4";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ATLAS_DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const GEMINI_PRIMARY_MODEL =
@@ -670,15 +670,16 @@ atlasWss.on("connection", (atlas, req) => {
         pacer.enqueue(pcm);
       }
 
-      if (content.generationComplete) {
+      // Different Live models/SDK versions may signal the end with either
+      // generationComplete or turnComplete. Mark the PCM pacer done on both;
+      // it sends turn_complete only after every queued audio byte is delivered.
+      if (content.generationComplete || content.turnComplete) {
+        console.log(
+          `[${deviceId}] Gemini end signal: generationComplete=` +
+            `${Boolean(content.generationComplete)} turnComplete=` +
+            `${Boolean(content.turnComplete)}`,
+        );
         handleGenerationDone();
-      } else if (
-        content.turnComplete &&
-        !pacer &&
-        currentTurn?.active
-      ) {
-        sendAtlasJson({ type: "turn_complete" });
-        finishTurn();
       }
     }
 
