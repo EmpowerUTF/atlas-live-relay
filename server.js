@@ -2,7 +2,7 @@ import http from "node:http";
 import { URL } from "node:url";
 
 const PORT = Number(process.env.PORT || 3000);
-const VERSION = "3.8.4-http-single-method";
+const VERSION = "3.8.5-http-stable-vad";
 const API_KEY = process.env.GEMINI_API_KEY || "";
 const DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-live-preview";
@@ -35,6 +35,10 @@ let activeTurn = null;
 let requestInProgress = false;
 let completedTurns = 0;
 let sessionConnections = 0;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function json(res, status, body) {
   if (res.writableEnded) return;
@@ -378,6 +382,18 @@ function submit(audio, res) {
   };
   activeTurn = turn;
 
+  // If the ESP32/TLS client disappears before a normal res.end(), release the
+  // turn immediately instead of leaving the next request blocked until timeout.
+  res.once("close", () => {
+    if (activeTurn !== turn || turn.finished || res.writableEnded) return;
+
+    turn.finished = true;
+    clearTimeout(turn.timeout);
+    clearTimeout(turn.finishTimer);
+    activeTurn = null;
+    console.warn("Atlas HTTP response closed early; released stale active turn.");
+  });
+
   try {
     session.sendRealtimeInput({ activityStart: {} });
     for (let offset = 0; offset < audio.length; offset += INPUT_CHUNK_BYTES) {
@@ -417,8 +433,8 @@ async function handleTurn(req, res, parsed) {
     json(res, 401, { ok: false, error: "unauthorized" });
     return;
   }
-  if (activeTurn || requestInProgress) {
-    json(res, 409, { ok: false, error: "atlas_busy" });
+  if (requestInProgress) {
+    json(res, 409, { ok: false, error: "atlas_upload_in_progress" });
     return;
   }
 
@@ -428,6 +444,19 @@ async function handleTurn(req, res, parsed) {
     const ready = ensureSession(false);
     const audio = await readBody(req);
     await ready;
+
+    // Never close the connection while the ESP32 is still uploading its body.
+    // If the previous response is only finishing, give it a brief grace period;
+    // otherwise return a clean 409 after the body has been fully consumed.
+    const busyDeadline = Date.now() + 2500;
+    while (activeTurn && Date.now() < busyDeadline) {
+      await sleep(50);
+    }
+    if (activeTurn) {
+      json(res, 409, { ok: false, error: "atlas_busy" });
+      return;
+    }
+
     if (!audio.length) throw Object.assign(new Error("empty_audio"), { status: 400 });
     if (audio.length % 2) throw Object.assign(new Error("odd_pcm_length"), { status: 400 });
     console.log(`Atlas HTTP upload received. Bytes: ${audio.length}`);
