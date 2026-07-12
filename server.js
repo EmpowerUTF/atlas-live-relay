@@ -2,7 +2,7 @@ import http from "node:http";
 import { URL } from "node:url";
 
 const PORT = Number(process.env.PORT || 3000);
-const VERSION = "3.8.3-http-locked-persistent-gemini";
+const VERSION = "3.8.5-http-finite-response";
 const API_KEY = process.env.GEMINI_API_KEY || "";
 const DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-live-preview";
@@ -20,7 +20,8 @@ const MAX_INPUT_BYTES = 320_000;
 const MAX_OUTPUT_BYTES = 768_000;
 const INPUT_CHUNK_BYTES = 16_000;
 const TURN_TIMEOUT_MS = 35_000;
-const FINISH_SETTLE_MS = 250;
+const FINISH_SETTLE_MS = 300;
+const AUDIO_IDLE_FALLBACK_MS = 1500;
 const RECONNECT_DELAY_MS = 1_000;
 
 let GoogleGenAI;
@@ -125,12 +126,21 @@ function scheduleReconnect(reason) {
   }, RECONNECT_DELAY_MS);
 }
 
+function clearTurnTimers(turn) {
+  if (!turn) return;
+  clearTimeout(turn.timeout);
+  clearTimeout(turn.finishTimer);
+  clearTimeout(turn.audioIdleTimer);
+  turn.timeout = null;
+  turn.finishTimer = null;
+  turn.audioIdleTimer = null;
+}
+
 function failTurn(status, message, resetSession = true) {
   const turn = activeTurn;
   if (!turn || turn.finished) return;
   turn.finished = true;
-  clearTimeout(turn.timeout);
-  clearTimeout(turn.finishTimer);
+  clearTurnTimers(turn);
   console.error(`Turn failed: ${message}`);
 
   if (!turn.res.writableEnded) {
@@ -149,37 +159,62 @@ function finishTurn(reason) {
   const turn = activeTurn;
   if (!turn || turn.finished) return;
   turn.finished = true;
-  clearTimeout(turn.timeout);
-  clearTimeout(turn.finishTimer);
+  clearTurnTimers(turn);
 
   if (!turn.outputBytes) {
     activeTurn = null;
-    if (!turn.res.headersSent) {
-      json(turn.res, 502, { ok: false, error: "gemini_returned_no_audio" });
-    } else if (!turn.res.writableEnded) {
-      turn.res.end();
-    }
+    json(turn.res, 502, { ok: false, error: "gemini_returned_no_audio" });
     clearSession("no audio");
     scheduleReconnect("no audio recovery");
     return;
   }
 
-  if (!turn.res.writableEnded) turn.res.end();
+  // IMPORTANT: keep the Gemini WebSocket persistent, but make every ESP32
+  // HTTP request finite. Buffer the complete Gemini reply in Railway, then
+  // send one response with an exact Content-Length and end it immediately.
+  // This prevents ESP32 HTTPClient::writeToStream() from waiting forever on
+  // an open/chunked response while still preserving clean file playback.
+  const body = Buffer.concat(turn.outputChunks, turn.outputBytes);
+  activeTurn = null;
   completedTurns += 1;
+
+  if (!turn.res.writableEnded) {
+    turn.res.writeHead(200, {
+      "content-type": "audio/pcm;rate=24000",
+      "content-length": String(body.length),
+      "cache-control": "no-store",
+      connection: "close",
+      "x-atlas-relay-version": VERSION,
+      "x-atlas-model": sessionModel,
+      "x-atlas-voice": VOICE,
+      "x-atlas-turn-end": reason,
+    });
+    turn.res.end(body);
+  }
+
   console.log(
     `Atlas HTTP response complete (${reason}). input=${turn.inputBytes} ` +
       `output=${turn.outputBytes} total=${Date.now() - turn.startedAt}ms ` +
       `session=${sessionSerial}`,
   );
-  activeTurn = null;
 }
 
-function scheduleFinish(reason) {
+function scheduleFinish(reason, delayMs = FINISH_SETTLE_MS) {
   const turn = activeTurn;
-  if (!turn || turn.finished || turn.finishTimer) return;
+  if (!turn || turn.finished) return;
+  clearTimeout(turn.finishTimer);
   turn.finishTimer = setTimeout(() => {
     if (activeTurn === turn) finishTurn(reason);
-  }, FINISH_SETTLE_MS);
+  }, delayMs);
+}
+
+function scheduleAudioIdleFallback() {
+  const turn = activeTurn;
+  if (!turn || turn.finished || !turn.outputBytes) return;
+  clearTimeout(turn.audioIdleTimer);
+  turn.audioIdleTimer = setTimeout(() => {
+    if (activeTurn === turn) finishTurn("audioIdleFallback");
+  }, AUDIO_IDLE_FALLBACK_MS);
 }
 
 function handleGeminiMessage(message, serial) {
@@ -212,26 +247,33 @@ function handleGeminiMessage(message, serial) {
       return;
     }
 
-    if (!activeTurn.res.headersSent) {
-      activeTurn.res.writeHead(200, {
-        "content-type": "audio/pcm;rate=24000",
-        "cache-control": "no-store",
-        connection: "close",
-        "x-atlas-relay-version": VERSION,
-        "x-atlas-model": sessionModel,
-        "x-atlas-voice": VOICE,
-      });
+    if (!activeTurn.outputBytes) {
       console.log(
         `First Gemini audio after ${Date.now() - activeTurn.submittedAt} ms.`,
       );
     }
 
+    activeTurn.outputChunks.push(pcm);
     activeTurn.outputBytes += pcm.length;
-    activeTurn.res.write(pcm);
+
+    // New audio after a completion marker means more audio was still in
+    // flight. Push the finite-response timer back so the tail is not cut.
+    if (activeTurn.completionSeen) {
+      scheduleFinish("generationComplete", FINISH_SETTLE_MS);
+    }
+    scheduleAudioIdleFallback();
   }
 
-  if (content.generationComplete || content.turnComplete) {
-    scheduleFinish(content.generationComplete ? "generationComplete" : "turnComplete");
+  if (content.generationComplete) {
+    activeTurn.completionSeen = true;
+    console.log("Gemini generationComplete received.");
+    scheduleFinish("generationComplete", FINISH_SETTLE_MS);
+  }
+
+  if (content.turnComplete) {
+    activeTurn.completionSeen = true;
+    console.log("Gemini turnComplete received.");
+    scheduleFinish("turnComplete", 80);
   }
 }
 
@@ -368,9 +410,12 @@ function submit(audio, res) {
     submittedAt: 0,
     inputBytes: audio.length,
     outputBytes: 0,
+    outputChunks: [],
+    completionSeen: false,
     finished: false,
     timeout: null,
     finishTimer: null,
+    audioIdleTimer: null,
   };
   activeTurn = turn;
 
@@ -453,7 +498,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "atlas-live-relay",
       version: VERSION,
-      mode: "proven-http-turn-persistent-gemini-only",
+      mode: "proven-http-turn-persistent-gemini-finite-response",
       configured: Boolean(API_KEY && DEVICE_TOKEN),
       geminiReady: Boolean(session),
       geminiConnecting: Boolean(connectPromise),
@@ -496,6 +541,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`Atlas Relay ${VERSION} listening on 0.0.0.0:${PORT}`);
   console.log("ESP32: proven HTTPS POST /turn per completed recording");
   console.log("Gemini: one persistent Live session reused between turns");
+  console.log("ESP32 HTTP: finite Content-Length response per turn");
   console.log(`Configured: ${Boolean(API_KEY && DEVICE_TOKEN)}`);
 
   if (API_KEY) {
