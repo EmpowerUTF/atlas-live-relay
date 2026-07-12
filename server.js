@@ -5,7 +5,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const RELAY_VERSION = "3.1.2-handoff-stable";
+const RELAY_VERSION = "3.1.1";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ATLAS_DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const GEMINI_PRIMARY_MODEL =
@@ -40,8 +40,6 @@ const ATLAS_BACKPRESSURE_BYTES = 128 * 1024;
 const SESSION_HANDLE_MAX_AGE_MS = 90 * 60 * 1000;
 const RECENT_HISTORY_TURNS = 10;
 const TRANSCRIPT_SETTLE_MS = 450;
-const ATLAS_HEARTBEAT_INTERVAL_MS = 20_000;
-const ATLAS_STALE_TIMEOUT_MS = 120_000;
 
 if (!GEMINI_API_KEY) {
   console.error("Missing required environment variable: GEMINI_API_KEY");
@@ -558,10 +556,8 @@ atlasWss.on("connection", (atlas, req) => {
   let activeModelIndex = 0;
   let geminiConnectionSerial = 0;
   let geminiRetryTimer = null;
-  let atlasLastSeenAt = Date.now();
+  let atlasTransportAlive = true;
   let atlasTransportHeartbeat = null;
-  let pendingGeminiRotation = false;
-  let pendingGeminiRotationReason = "";
 
   const geminiModels = [...new Set(
     [GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL].filter(Boolean),
@@ -664,21 +660,6 @@ atlasWss.on("connection", (atlas, req) => {
     }
   };
 
-  const rotateGeminiIfSafe = () => {
-    if (!pendingGeminiRotation || closed) return;
-    if (currentTurn?.active) return;
-    if (pacer && !pacer.closed) return;
-
-    const reason =
-      pendingGeminiRotationReason || "deferred Gemini session rotation";
-    pendingGeminiRotation = false;
-    pendingGeminiRotationReason = "";
-
-    console.log(`[${deviceId}] Rotating Gemini after completed Atlas turn.`);
-    closeGeminiSession();
-    scheduleGeminiConnect(0, 500, reason);
-  };
-
   const handleGenerationDone = () => {
     if (!currentTurn?.active) return;
 
@@ -686,7 +667,6 @@ atlasWss.on("connection", (atlas, req) => {
       sendAtlasJson({ type: "generation_complete" });
       sendAtlasJson({ type: "turn_complete" });
       finishTurn();
-      rotateGeminiIfSafe();
       return;
     }
 
@@ -761,9 +741,8 @@ atlasWss.on("connection", (atlas, req) => {
           pacer = new PcmPacer(atlas, () => {
             sendAtlasJson({ type: "generation_complete" });
             sendAtlasJson({ type: "turn_complete" });
-            pacer = null;
             finishTurn();
-            rotateGeminiIfSafe();
+            pacer = null;
           });
         }
 
@@ -790,13 +769,19 @@ atlasWss.on("connection", (atlas, req) => {
     if (message.goAway) {
       console.log(
         `[${deviceId}] Gemini requested session rotation ` +
-          `model=${activeGeminiModel}; deferring until reply audio drains.`,
+          `model=${activeGeminiModel}.`,
       );
       sendAtlasJson({ type: "go_away", detail: message.goAway });
 
-      pendingGeminiRotation = true;
-      pendingGeminiRotationReason = "Gemini session rotation";
-      rotateGeminiIfSafe();
+      setTimeout(() => {
+        if (
+          !closed &&
+          connectionSerial === geminiConnectionSerial
+        ) {
+          closeGeminiSession();
+          scheduleGeminiConnect(0, 500, "Gemini session rotation");
+        }
+      }, 250);
     }
   };
 
@@ -916,25 +901,6 @@ atlasWss.on("connection", (atlas, req) => {
             // when a previously established session later ends.
             if (!wasReady) return;
 
-            // If reply PCM is already queued, let Atlas hear every queued
-            // byte and receive turn_complete before entering reconnect state.
-            if (
-              currentTurn?.active &&
-              currentTurn.outputBytes > 0 &&
-              pacer &&
-              !pacer.closed
-            ) {
-              console.warn(
-                `[${deviceId}] Gemini closed while reply PCM was queued; ` +
-                  "draining queued audio before reconnect.",
-              );
-              pendingGeminiRotation = true;
-              pendingGeminiRotationReason =
-                "Gemini closed after buffered response";
-              pacer.markDone();
-              return;
-            }
-
             sendAtlasJson({
               type: "session_reconnecting",
               reason: "gemini_session_closed",
@@ -1019,8 +985,6 @@ atlasWss.on("connection", (atlas, req) => {
   };
 
   atlas.on("message", (data, isBinary) => {
-    atlasLastSeenAt = Date.now();
-
     if (isBinary) {
       if (!geminiReady || !geminiSession) return;
       if (!currentTurn?.active) return;
@@ -1099,31 +1063,28 @@ atlasWss.on("connection", (atlas, req) => {
 
 
   // Keep the Railway edge and ESP32 WebSocket alive independently of Gemini.
-  // Any audio, control message, application pong, or transport pong proves
-  // the client is alive. Never kill a healthy turn after one delayed pong.
+  // This is transport-level ping/pong, so a Gemini session rotation cannot
+  // make Atlas lose its relay socket.
   atlas.on("pong", () => {
-    atlasLastSeenAt = Date.now();
+    atlasTransportAlive = true;
   });
 
   atlasTransportHeartbeat = setInterval(() => {
     if (closed || atlas.readyState !== WebSocket.OPEN) return;
 
-    const idleMs = Date.now() - atlasLastSeenAt;
-    if (idleMs > ATLAS_STALE_TIMEOUT_MS) {
-      console.warn(
-        `[${deviceId}] Atlas transport silent for ${idleMs} ms; ` +
-          "terminating genuinely stale socket.",
-      );
+    if (!atlasTransportAlive) {
+      console.warn(`[${deviceId}] Atlas transport heartbeat missed; terminating stale socket.`);
       atlas.terminate();
       return;
     }
 
+    atlasTransportAlive = false;
     try {
       atlas.ping();
     } catch (error) {
       console.error(`[${deviceId}] Atlas ping failed: ${error.message}`);
     }
-  }, ATLAS_HEARTBEAT_INTERVAL_MS);
+  }, 20_000);
 
   atlas.on("error", (error) => {
     console.error(`[${deviceId}] Atlas socket error:`, error.message);
