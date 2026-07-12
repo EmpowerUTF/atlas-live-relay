@@ -1,16 +1,12 @@
 {
   "name": "atlas-live-relay",
-  "version": "3.0.1",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=20"
-  },
   "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "ws": "8.18.3"
+    "@google/genai": "^2.11.0"
   }
 }
