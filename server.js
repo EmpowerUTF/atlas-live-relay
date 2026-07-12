@@ -985,6 +985,11 @@ atlasWss.on("connection", (atlas, req) => {
   };
 
   atlas.on("message", (data, isBinary) => {
+    // Any audio or control message proves Atlas is alive. The original
+    // heartbeat only accepted WebSocket pong frames, so it could terminate
+    // a device that was actively streaming microphone audio.
+    atlasTransportAlive = true;
+
     if (isBinary) {
       if (!geminiReady || !geminiSession) return;
       if (!currentTurn?.active) return;
