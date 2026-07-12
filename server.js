@@ -5,7 +5,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const RELAY_VERSION = "3.1.1";
+const RELAY_VERSION = "3.1.3-narrow-transport-end";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ATLAS_DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
 const GEMINI_PRIMARY_MODEL =
@@ -40,6 +40,8 @@ const ATLAS_BACKPRESSURE_BYTES = 128 * 1024;
 const SESSION_HANDLE_MAX_AGE_MS = 90 * 60 * 1000;
 const RECENT_HISTORY_TURNS = 10;
 const TRANSCRIPT_SETTLE_MS = 450;
+const ATLAS_HEARTBEAT_INTERVAL_MS = 20_000;
+const ATLAS_STALE_TIMEOUT_MS = 120_000;
 
 if (!GEMINI_API_KEY) {
   console.error("Missing required environment variable: GEMINI_API_KEY");
@@ -556,8 +558,10 @@ atlasWss.on("connection", (atlas, req) => {
   let activeModelIndex = 0;
   let geminiConnectionSerial = 0;
   let geminiRetryTimer = null;
-  let atlasTransportAlive = true;
+  let atlasLastSeenAt = Date.now();
   let atlasTransportHeartbeat = null;
+  let pendingGeminiRotation = false;
+  let pendingGeminiRotationReason = "";
 
   const geminiModels = [...new Set(
     [GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL].filter(Boolean),
@@ -584,6 +588,8 @@ atlasWss.on("connection", (atlas, req) => {
       firstAudioLatencyMs: 0,
       totalTurnMs: 0,
       usage: {},
+      generationCompleteForwarded: false,
+      turnCompleteSeen: false,
       active: true,
     };
   };
@@ -660,13 +666,36 @@ atlasWss.on("connection", (atlas, req) => {
     }
   };
 
-  const handleGenerationDone = () => {
-    if (!currentTurn?.active) return;
+  const rotateGeminiIfSafe = () => {
+    if (!pendingGeminiRotation || closed) return;
+    if (currentTurn?.active) return;
+    if (pacer && !pacer.closed) return;
+
+    const reason =
+      pendingGeminiRotationReason || "deferred Gemini session rotation";
+    pendingGeminiRotation = false;
+    pendingGeminiRotationReason = "";
+
+    console.log(`[${deviceId}] Rotating Gemini after completed Atlas turn.`);
+    closeGeminiSession();
+    scheduleGeminiConnect(0, 500, reason);
+  };
+
+  const forwardGenerationComplete = () => {
+    if (!currentTurn?.active || currentTurn.generationCompleteForwarded) return;
+    currentTurn.generationCompleteForwarded = true;
+    sendAtlasJson({ type: "generation_complete" });
+  };
+
+  const handleTurnComplete = () => {
+    if (!currentTurn?.active || currentTurn.turnCompleteSeen) return;
+    currentTurn.turnCompleteSeen = true;
+    forwardGenerationComplete();
 
     if (!pacer) {
-      sendAtlasJson({ type: "generation_complete" });
       sendAtlasJson({ type: "turn_complete" });
       finishTurn();
+      rotateGeminiIfSafe();
       return;
     }
 
@@ -739,26 +768,28 @@ atlasWss.on("connection", (atlas, req) => {
 
         if (!pacer || pacer.closed) {
           pacer = new PcmPacer(atlas, () => {
-            sendAtlasJson({ type: "generation_complete" });
+            forwardGenerationComplete();
             sendAtlasJson({ type: "turn_complete" });
-            finishTurn();
             pacer = null;
+            finishTurn();
+            rotateGeminiIfSafe();
           });
         }
 
         pacer.enqueue(pcm);
       }
 
-      // Different Live models/SDK versions may signal the end with either
-      // generationComplete or turnComplete. Mark the PCM pacer done on both;
-      // it sends turn_complete only after every queued audio byte is delivered.
-      if (content.generationComplete || content.turnComplete) {
-        console.log(
-          `[${deviceId}] Gemini end signal: generationComplete=` +
-            `${Boolean(content.generationComplete)} turnComplete=` +
-            `${Boolean(content.turnComplete)}`,
-        );
-        handleGenerationDone();
+      // generationComplete means generation has ended; turnComplete means the
+      // model has finished sending the turn. Do not close Atlas playback on the
+      // earlier generationComplete signal because later PCM may still arrive.
+      if (content.generationComplete) {
+        console.log(`[${deviceId}] Gemini generationComplete received.`);
+        forwardGenerationComplete();
+      }
+
+      if (content.turnComplete) {
+        console.log(`[${deviceId}] Gemini turnComplete received.`);
+        handleTurnComplete();
       }
     }
 
@@ -769,19 +800,13 @@ atlasWss.on("connection", (atlas, req) => {
     if (message.goAway) {
       console.log(
         `[${deviceId}] Gemini requested session rotation ` +
-          `model=${activeGeminiModel}.`,
+          `model=${activeGeminiModel}; waiting for current reply to drain.`,
       );
       sendAtlasJson({ type: "go_away", detail: message.goAway });
 
-      setTimeout(() => {
-        if (
-          !closed &&
-          connectionSerial === geminiConnectionSerial
-        ) {
-          closeGeminiSession();
-          scheduleGeminiConnect(0, 500, "Gemini session rotation");
-        }
-      }, 250);
+      pendingGeminiRotation = true;
+      pendingGeminiRotationReason = "Gemini session rotation";
+      rotateGeminiIfSafe();
     }
   };
 
@@ -901,6 +926,23 @@ atlasWss.on("connection", (atlas, req) => {
             // when a previously established session later ends.
             if (!wasReady) return;
 
+            if (
+              currentTurn?.active &&
+              currentTurn.outputBytes > 0 &&
+              pacer &&
+              !pacer.closed
+            ) {
+              console.warn(
+                `[${deviceId}] Gemini closed after reply PCM arrived; ` +
+                  "draining queued audio before reconnect.",
+              );
+              pendingGeminiRotation = true;
+              pendingGeminiRotationReason =
+                "Gemini closed after buffered response";
+              pacer.markDone();
+              return;
+            }
+
             sendAtlasJson({
               type: "session_reconnecting",
               reason: "gemini_session_closed",
@@ -985,10 +1027,7 @@ atlasWss.on("connection", (atlas, req) => {
   };
 
   atlas.on("message", (data, isBinary) => {
-    // Any audio or control message proves Atlas is alive. The original
-    // heartbeat only accepted WebSocket pong frames, so it could terminate
-    // a device that was actively streaming microphone audio.
-    atlasTransportAlive = true;
+    atlasLastSeenAt = Date.now();
 
     if (isBinary) {
       if (!geminiReady || !geminiSession) return;
@@ -1067,29 +1106,31 @@ atlasWss.on("connection", (atlas, req) => {
   });
 
 
-  // Keep the Railway edge and ESP32 WebSocket alive independently of Gemini.
-  // This is transport-level ping/pong, so a Gemini session rotation cannot
-  // make Atlas lose its relay socket.
+  // Keep the Railway edge alive without killing an active ESP32 after one
+  // delayed pong. Audio, control messages, and transport pongs all prove life.
   atlas.on("pong", () => {
-    atlasTransportAlive = true;
+    atlasLastSeenAt = Date.now();
   });
 
   atlasTransportHeartbeat = setInterval(() => {
     if (closed || atlas.readyState !== WebSocket.OPEN) return;
 
-    if (!atlasTransportAlive) {
-      console.warn(`[${deviceId}] Atlas transport heartbeat missed; terminating stale socket.`);
+    const idleMs = Date.now() - atlasLastSeenAt;
+    if (idleMs > ATLAS_STALE_TIMEOUT_MS) {
+      console.warn(
+        `[${deviceId}] Atlas transport silent for ${idleMs} ms; ` +
+          "terminating genuinely stale socket.",
+      );
       atlas.terminate();
       return;
     }
 
-    atlasTransportAlive = false;
     try {
       atlas.ping();
     } catch (error) {
       console.error(`[${deviceId}] Atlas ping failed: ${error.message}`);
     }
-  }, 20_000);
+  }, ATLAS_HEARTBEAT_INTERVAL_MS);
 
   atlas.on("error", (error) => {
     console.error(`[${deviceId}] Atlas socket error:`, error.message);
