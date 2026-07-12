@@ -1,486 +1,475 @@
 import http from "node:http";
+import crypto from "node:crypto";
 import { URL } from "node:url";
+import { GoogleGenAI, Modality } from "@google/genai";
+import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const VERSION = "3.8.5-http-finite-response";
-const API_KEY = process.env.GEMINI_API_KEY || "";
-const DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-live-preview";
-const FALLBACK_MODEL =
+const RELAY_VERSION = "3.1.3";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const ATLAS_DEVICE_TOKEN = process.env.ATLAS_DEVICE_TOKEN || "";
+const GEMINI_PRIMARY_MODEL =
+  process.env.GEMINI_MODEL || "gemini-3.1-flash-live-preview";
+const GEMINI_FALLBACK_MODEL =
   process.env.GEMINI_FALLBACK_MODEL ||
   "gemini-2.5-flash-native-audio-preview-12-2025";
-const VOICE = process.env.ATLAS_VOICE || "Kore";
-const SYSTEM_INSTRUCTION =
+const GEMINI_RETRY_DELAY_MS = 1500;
+const ATLAS_VOICE = "Charon";
+const BASE_SYSTEM_INSTRUCTION =
   process.env.ATLAS_SYSTEM_INSTRUCTION ||
-  "You are Atlas, a fast, practical AI companion. Answer the owner's spoken request directly. " +
-    "Do not greet unless greeted. Keep ordinary answers concise. If speech is genuinely unclear, " +
-    "say: I didn't catch that. Could you say it again?";
+  "You are Atlas, a fast, practical AI companion. Speak naturally and directly. " +
+    "Keep routine replies concise. Ask one useful follow-up only when it is genuinely needed.";
 
-const MAX_INPUT_BYTES = 320_000;
-const MAX_OUTPUT_BYTES = 768_000;
-const INPUT_CHUNK_BYTES = 16_000;
-const TURN_TIMEOUT_MS = 35_000;
-const FINISH_SETTLE_MS = 300;
-const AUDIO_IDLE_FALLBACK_MS = 1500;
-const RECONNECT_DELAY_MS = 1_000;
+const LANGUAGE_AND_VOICE_LOCK =
+  "LANGUAGE AND VOICE REQUIREMENT: Always speak in English only. " +
+  "Never answer in Spanish or any other language, even if automatic transcription " +
+  "mistakenly labels the owner's English speech as another language. " +
+  "Speak as an articulate adult British man using cultivated modern Received " +
+  "Pronunciation: sophisticated, measured, intelligent, warm, and natural. " +
+  "Avoid American pronunciation, exaggerated aristocratic affectation, theatrical " +
+  "delivery, rushed speech, and vocal fry. Use clean phrasing and an even pace. " +
+  "Do not imitate the language or accent inferred from noisy audio. " +
+  "Only change language if the owner explicitly says the exact words: switch language.";
 
-let GoogleGenAI;
-let Modality;
-let ai;
-let session = null;
-let sessionModel = "";
-let sessionSerial = 0;
-let connectPromise = null;
-let reconnectTimer = null;
-let activeTurn = null;
-let requestInProgress = false;
-let completedTurns = 0;
-let sessionConnections = 0;
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
 
-function json(res, status, body) {
+const MAX_ATLAS_MESSAGE_BYTES = 64 * 1024;
+const PCM_SLICE_BYTES = 1920; // 40 ms of 24 kHz mono PCM16.
+const PCM_SLICE_MS = 40;
+const PCM_START_BUFFER_BYTES = 19_200; // 400 ms before first downlink frame.
+const ATLAS_BACKPRESSURE_BYTES = 128 * 1024;
+const SESSION_HANDLE_MAX_AGE_MS = 90 * 60 * 1000;
+const RECENT_HISTORY_TURNS = 10;
+const TRANSCRIPT_SETTLE_MS = 450;
+
+if (!GEMINI_API_KEY) {
+  console.error("Missing required environment variable: GEMINI_API_KEY");
+  process.exit(1);
+}
+if (!ATLAS_DEVICE_TOKEN) {
+  console.error("Missing required environment variable: ATLAS_DEVICE_TOKEN");
+  process.exit(1);
+}
+
+const googleAi = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+function jsonResponse(res, status, payload) {
   if (res.writableEnded) return;
-  const data = JSON.stringify(body);
+  const body = JSON.stringify(payload);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
-    "content-length": String(Buffer.byteLength(data)),
+    "content-length": Buffer.byteLength(body),
     "cache-control": "no-store",
-    connection: "close",
   });
-  res.end(data);
+  res.end(body);
 }
 
 function authorized(parsed) {
-  return DEVICE_TOKEN && parsed.searchParams.get("token") === DEVICE_TOKEN;
+  return parsed.searchParams.get("token") === ATLAS_DEVICE_TOKEN;
 }
 
-async function loadSdk() {
-  if (GoogleGenAI) return;
-
-  if (process.env.ATLAS_MOCK_GEMINI === "1") {
-    Modality = { AUDIO: "AUDIO" };
-    GoogleGenAI = class MockGoogleGenAI {
-      constructor() {
-        this.live = {
-          connect: async ({ callbacks }) => {
-            sessionConnections += 1;
-            queueMicrotask(() => callbacks.onopen?.());
-            return {
-              sendRealtimeInput(message) {
-                if (message.activityEnd) {
-                  setTimeout(() => {
-                    const pcm = Buffer.alloc(9_600, 0x01).toString("base64");
-                    callbacks.onmessage?.({
-                      serverContent: {
-                        modelTurn: {
-                          parts: [
-                            { inlineData: { data: pcm, mimeType: "audio/pcm;rate=24000" } },
-                          ],
-                        },
-                      },
-                    });
-                    callbacks.onmessage?.({
-                      serverContent: { turnComplete: true },
-                    });
-                  }, 10);
-                }
-              },
-              close() {
-                callbacks.onclose?.({ code: 1000, reason: "mock close" });
-              },
-            };
-          },
-        };
-      }
-    };
-    return;
-  }
-
-  const sdk = await import("@google/genai");
-  GoogleGenAI = sdk.GoogleGenAI;
-  Modality = sdk.Modality;
-}
-
-function clearSession(reason) {
-  const old = session;
-  session = null;
-  sessionModel = "";
-  sessionSerial += 1;
-  if (old) {
-    try {
-      old.close();
-    } catch (error) {
-      console.error(`Gemini close error (${reason}):`, error.message);
-    }
-  }
-}
-
-function scheduleReconnect(reason) {
-  if (reconnectTimer || activeTurn || !API_KEY) return;
-  console.log(`Gemini reconnect scheduled: ${reason}`);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    void ensureSession(true).catch((error) => {
-      console.error("Gemini reconnect failed:", error.message);
-      scheduleReconnect("retry");
-    });
-  }, RECONNECT_DELAY_MS);
-}
-
-function clearTurnTimers(turn) {
-  if (!turn) return;
-  clearTimeout(turn.timeout);
-  clearTimeout(turn.finishTimer);
-  clearTimeout(turn.audioIdleTimer);
-  turn.timeout = null;
-  turn.finishTimer = null;
-  turn.audioIdleTimer = null;
-}
-
-function failTurn(status, message, resetSession = true) {
-  const turn = activeTurn;
-  if (!turn || turn.finished) return;
-  turn.finished = true;
-  clearTurnTimers(turn);
-  console.error(`Turn failed: ${message}`);
-
-  if (!turn.res.writableEnded) {
-    if (!turn.res.headersSent) json(turn.res, status, { ok: false, error: message });
-    else turn.res.destroy();
-  }
-
-  activeTurn = null;
-  if (resetSession) {
-    clearSession(message);
-    scheduleReconnect("turn recovery");
-  }
-}
-
-function finishTurn(reason) {
-  const turn = activeTurn;
-  if (!turn || turn.finished) return;
-  turn.finished = true;
-  clearTurnTimers(turn);
-
-  if (!turn.outputBytes) {
-    activeTurn = null;
-    json(turn.res, 502, { ok: false, error: "gemini_returned_no_audio" });
-    clearSession("no audio");
-    scheduleReconnect("no audio recovery");
-    return;
-  }
-
-  // IMPORTANT: keep the Gemini WebSocket persistent, but make every ESP32
-  // HTTP request finite. Buffer the complete Gemini reply in Railway, then
-  // send one response with an exact Content-Length and end it immediately.
-  // This prevents ESP32 HTTPClient::writeToStream() from waiting forever on
-  // an open/chunked response while still preserving clean file playback.
-  const body = Buffer.concat(turn.outputChunks, turn.outputBytes);
-  activeTurn = null;
-  completedTurns += 1;
-
-  if (!turn.res.writableEnded) {
-    turn.res.writeHead(200, {
-      "content-type": "audio/pcm;rate=24000",
-      "content-length": String(body.length),
-      "cache-control": "no-store",
-      connection: "close",
-      "x-atlas-relay-version": VERSION,
-      "x-atlas-model": sessionModel,
-      "x-atlas-voice": VOICE,
-      "x-atlas-turn-end": reason,
-    });
-    turn.res.end(body);
-  }
-
-  console.log(
-    `Atlas HTTP response complete (${reason}). input=${turn.inputBytes} ` +
-      `output=${turn.outputBytes} total=${Date.now() - turn.startedAt}ms ` +
-      `session=${sessionSerial}`,
-  );
-}
-
-function scheduleFinish(reason, delayMs = FINISH_SETTLE_MS) {
-  const turn = activeTurn;
-  if (!turn || turn.finished) return;
-  clearTimeout(turn.finishTimer);
-  turn.finishTimer = setTimeout(() => {
-    if (activeTurn === turn) finishTurn(reason);
-  }, delayMs);
-}
-
-function scheduleAudioIdleFallback() {
-  const turn = activeTurn;
-  if (!turn || turn.finished || !turn.outputBytes) return;
-  clearTimeout(turn.audioIdleTimer);
-  turn.audioIdleTimer = setTimeout(() => {
-    if (activeTurn === turn) finishTurn("audioIdleFallback");
-  }, AUDIO_IDLE_FALLBACK_MS);
-}
-
-function handleGeminiMessage(message, serial) {
-  if (serial !== sessionSerial) return;
-
-  if (message?.goAway) {
-    console.log("Gemini GoAway received; reconnecting after this turn.");
-    if (!activeTurn) {
-      clearSession("GoAway");
-      scheduleReconnect("GoAway");
-    }
-  }
-
-  const content = message?.serverContent;
-  if (!content || !activeTurn) return;
-
-  if (content.interrupted) {
-    failTurn(409, "gemini_interrupted");
-    return;
-  }
-
-  for (const part of content.modelTurn?.parts || []) {
-    const inline = part.inlineData;
-    if (!inline?.data || !(inline.mimeType || "").startsWith("audio/pcm")) continue;
-
-    const pcm = Buffer.from(inline.data, "base64");
-    if (!pcm.length) continue;
-    if (activeTurn.outputBytes + pcm.length > MAX_OUTPUT_BYTES) {
-      failTurn(502, "gemini_audio_too_long");
-      return;
-    }
-
-    if (!activeTurn.outputBytes) {
-      console.log(
-        `First Gemini audio after ${Date.now() - activeTurn.submittedAt} ms.`,
-      );
-    }
-
-    activeTurn.outputChunks.push(pcm);
-    activeTurn.outputBytes += pcm.length;
-
-    // New audio after a completion marker means more audio was still in
-    // flight. Push the finite-response timer back so the tail is not cut.
-    if (activeTurn.completionSeen) {
-      scheduleFinish("generationComplete", FINISH_SETTLE_MS);
-    }
-    scheduleAudioIdleFallback();
-  }
-
-  if (content.generationComplete) {
-    activeTurn.completionSeen = true;
-    console.log("Gemini generationComplete received.");
-    scheduleFinish("generationComplete", FINISH_SETTLE_MS);
-  }
-
-  if (content.turnComplete) {
-    activeTurn.completionSeen = true;
-    console.log("Gemini turnComplete received.");
-    scheduleFinish("turnComplete", 80);
-  }
-}
-
-async function connectModel(model) {
-  await loadSdk();
-  if (!ai) ai = new GoogleGenAI({ apiKey: API_KEY });
-
-  const serial = ++sessionSerial;
-  const config = {
-    responseModalities: [Modality.AUDIO],
-    systemInstruction: SYSTEM_INSTRUCTION,
-    realtimeInputConfig: {
-      automaticActivityDetection: { disabled: true },
-    },
-    speechConfig: {
-      voiceConfig: {
-        prebuiltVoiceConfig: { voiceName: VOICE },
-      },
-    },
-  };
-  if (model.includes("3.1")) config.thinkingConfig = { thinkingLevel: "minimal" };
-
-  console.log(`Opening persistent Gemini Live session: ${model}`);
-  const next = await ai.live.connect({
-    model,
-    config,
-    callbacks: {
-      onopen() {
-        if (serial === sessionSerial) console.log(`Gemini Live opened: ${model}`);
-      },
-      onmessage(message) {
-        handleGeminiMessage(message, serial);
-      },
-      onerror(event) {
-        if (serial !== sessionSerial) return;
-        const detail = event?.message || String(event);
-        console.error(`Gemini Live error: ${detail}`);
-        if (activeTurn) failTurn(502, `gemini_error: ${detail}`);
-        else {
-          session = null;
-          sessionModel = "";
-          scheduleReconnect("socket error");
-        }
-      },
-      onclose(event) {
-        if (serial !== sessionSerial) return;
-        const code = event?.code ?? 1000;
-        const reason = event?.reason || "";
-        console.log(`Gemini Live closed: ${code} ${reason}`);
-        session = null;
-        sessionModel = "";
-        if (activeTurn) failTurn(503, `gemini_session_closed_${code}`, false);
-        scheduleReconnect("socket closed");
-      },
-    },
-  });
-
-  if (serial !== sessionSerial) {
-    try { next.close(); } catch {}
-    throw new Error("superseded Gemini connection");
-  }
-
-  session = next;
-  sessionModel = model;
-  sessionConnections += process.env.ATLAS_MOCK_GEMINI === "1" ? 0 : 1;
-  console.log(`Persistent Gemini Live ready: ${model}`);
-  return next;
-}
-
-async function ensureSession(force = false) {
-  if (!API_KEY) throw new Error("missing_GEMINI_API_KEY");
-  if (session && !force) return session;
-  if (connectPromise) return connectPromise;
-  if (session && force) clearSession("forced reconnect");
-
-  connectPromise = (async () => {
-    let lastError;
-    for (const model of [...new Set([MODEL, FALLBACK_MODEL].filter(Boolean))]) {
-      try {
-        return await connectModel(model);
-      } catch (error) {
-        lastError = error;
-        console.error(`Gemini connection failed (${model}):`, error.message);
-      }
-    }
-    throw lastError || new Error("no_live_model_available");
-  })();
-
-  try {
-    return await connectPromise;
-  } finally {
-    connectPromise = null;
-  }
-}
-
-function readBody(req) {
+function readJsonBody(req, maxBytes = 32 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
-    let settled = false;
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      reject(error);
-    };
-
     req.on("data", (chunk) => {
-      if (settled) return;
       total += chunk.length;
-      if (total > MAX_INPUT_BYTES) {
-        fail(Object.assign(new Error("input_too_large"), { status: 413 }));
+      if (total > maxBytes) {
+        reject(Object.assign(new Error("body_too_large"), { status: 413 }));
         req.destroy();
         return;
       }
       chunks.push(Buffer.from(chunk));
     });
     req.on("end", () => {
-      if (settled) return;
-      settled = true;
-      resolve(Buffer.concat(chunks, total));
+      try {
+        const text = Buffer.concat(chunks, total).toString("utf8");
+        resolve(text ? JSON.parse(text) : {});
+      } catch {
+        reject(Object.assign(new Error("invalid_json"), { status: 400 }));
+      }
     });
-    req.on("aborted", () => fail(Object.assign(new Error("client_aborted_upload"), { status: 499 })));
-    req.on("error", (error) => fail(Object.assign(error, { status: 400 })));
+    req.on("error", reject);
   });
 }
 
-function submit(audio, res) {
-  if (!session) throw Object.assign(new Error("gemini_not_ready"), { status: 503 });
-  if (activeTurn) throw Object.assign(new Error("atlas_busy"), { status: 409 });
+function safeDeviceId(value) {
+  const cleaned = String(value || "atlas-v1").replace(/[^a-zA-Z0-9_.-]/g, "");
+  return cleaned.slice(0, 64) || "atlas-v1";
+}
 
-  const turn = {
-    res,
-    startedAt: Date.now(),
-    submittedAt: 0,
-    inputBytes: audio.length,
-    outputBytes: 0,
-    outputChunks: [],
-    completionSeen: false,
-    finished: false,
-    timeout: null,
-    finishTimer: null,
-    audioIdleTimer: null,
+function mergeTranscript(current, fragment) {
+  const next = String(fragment || "").trim();
+  if (!next) return current;
+  const existing = String(current || "").trim();
+  if (!existing) return next;
+  if (existing === next || existing.endsWith(next)) return existing;
+  if (next.startsWith(existing)) return next;
+  return `${existing}${/^[,.;:!?]/.test(next) ? "" : " "}${next}`;
+}
+
+async function supabaseRequest(path, { method = "GET", body, prefer } = {}) {
+  if (!SUPABASE_ENABLED) return null;
+  const headers = {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    "content-type": "application/json",
   };
-  activeTurn = turn;
+  if (prefer) headers.prefer = prefer;
 
-  try {
-    session.sendRealtimeInput({ activityStart: {} });
-    for (let offset = 0; offset < audio.length; offset += INPUT_CHUNK_BYTES) {
-      const chunk = audio.subarray(offset, Math.min(offset + INPUT_CHUNK_BYTES, audio.length));
-      session.sendRealtimeInput({
-        audio: {
-          data: chunk.toString("base64"),
-          mimeType: "audio/pcm;rate=16000",
-        },
-      });
+  const response = await fetch(`${SUPABASE_URL}${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Supabase ${response.status}: ${text.slice(0, 500)}`);
+  }
+  return text ? JSON.parse(text) : null;
+}
+
+async function loadSessionState(deviceId) {
+  if (!SUPABASE_ENABLED) return null;
+  const rows = await supabaseRequest(
+    `/rest/v1/atlas_session_state?device_id=eq.${encodeURIComponent(deviceId)}` +
+      `&select=device_id,conversation_id,resume_handle,updated_at&limit=1`,
+  );
+  return rows?.[0] || null;
+}
+
+async function upsertSessionState(deviceId, conversationId, resumeHandle) {
+  if (!SUPABASE_ENABLED || !resumeHandle) return;
+  await supabaseRequest("/rest/v1/atlas_session_state?on_conflict=device_id", {
+    method: "POST",
+    prefer: "resolution=merge-duplicates,return=minimal",
+    body: {
+      device_id: deviceId,
+      conversation_id: conversationId,
+      resume_handle: resumeHandle,
+      updated_at: new Date().toISOString(),
+    },
+  });
+}
+
+async function clearSessionState(deviceId) {
+  if (!SUPABASE_ENABLED) return;
+  await supabaseRequest(
+    `/rest/v1/atlas_session_state?device_id=eq.${encodeURIComponent(deviceId)}`,
+    { method: "DELETE", prefer: "return=minimal" },
+  );
+}
+
+async function createConversation(deviceId) {
+  const id = crypto.randomUUID();
+  if (SUPABASE_ENABLED) {
+    await supabaseRequest("/rest/v1/atlas_conversations", {
+      method: "POST",
+      prefer: "return=minimal",
+      body: {
+        id,
+        device_id: deviceId,
+        started_at: new Date().toISOString(),
+        last_active_at: new Date().toISOString(),
+      },
+    });
+  }
+  return id;
+}
+
+async function touchConversation(conversationId) {
+  if (!SUPABASE_ENABLED || !conversationId) return;
+  await supabaseRequest(
+    `/rest/v1/atlas_conversations?id=eq.${encodeURIComponent(conversationId)}`,
+    {
+      method: "PATCH",
+      prefer: "return=minimal",
+      body: { last_active_at: new Date().toISOString() },
+    },
+  );
+}
+
+async function loadRecentTurns(deviceId) {
+  if (!SUPABASE_ENABLED) return [];
+  const rows = await supabaseRequest(
+    `/rest/v1/atlas_turns?device_id=eq.${encodeURIComponent(deviceId)}` +
+      `&select=user_text,atlas_text,created_at&order=created_at.desc&limit=${RECENT_HISTORY_TURNS}`,
+  );
+  return Array.isArray(rows) ? rows.reverse() : [];
+}
+
+async function loadMemories(deviceId) {
+  if (!SUPABASE_ENABLED) return [];
+  const rows = await supabaseRequest(
+    `/rest/v1/atlas_memories?device_id=eq.${encodeURIComponent(deviceId)}` +
+      "&active=eq.true&select=memory_key,content,importance&order=importance.desc,updated_at.desc&limit=30",
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function saveTurn(turn) {
+  if (!SUPABASE_ENABLED) return;
+  await supabaseRequest("/rest/v1/atlas_turns", {
+    method: "POST",
+    prefer: "return=minimal",
+    body: {
+      conversation_id: turn.conversationId,
+      device_id: turn.deviceId,
+      turn_index: turn.turnIndex,
+      user_text: turn.inputTranscript || null,
+      atlas_text: turn.outputTranscript || null,
+      input_bytes: turn.inputBytes,
+      output_bytes: turn.outputBytes,
+      first_audio_latency_ms: turn.firstAudioLatencyMs || null,
+      total_turn_ms: turn.totalTurnMs || null,
+      usage: turn.usage || {},
+      created_at: new Date(turn.startedAt).toISOString(),
+    },
+  });
+  await touchConversation(turn.conversationId);
+}
+
+function buildSystemInstruction(memories, recentTurns = []) {
+  let instruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${LANGUAGE_AND_VOICE_LOCK}`;
+
+  if (memories.length) {
+    const memoryLines = memories.map((item) => `- ${item.content}`).join("\n");
+    instruction +=
+      "\n\nDurable owner memory supplied by Atlas storage. " +
+      "Use it only when relevant; do not mention the storage system:\n" +
+      memoryLines;
+  }
+
+  if (recentTurns.length) {
+    const recentLines = [];
+    for (const turn of recentTurns.slice(-6)) {
+      if (turn.user_text) recentLines.push(`Owner: ${turn.user_text}`);
+      if (turn.atlas_text) recentLines.push(`Atlas: ${turn.atlas_text}`);
     }
-    session.sendRealtimeInput({ activityEnd: {} });
-    turn.submittedAt = Date.now();
-    console.log(
-      `PCM submitted to persistent Gemini session. bytes=${audio.length} ` +
-        `model=${sessionModel} session=${sessionSerial}`,
-    );
-    turn.timeout = setTimeout(() => {
-      if (activeTurn === turn) failTurn(504, "gemini_reply_timeout");
-    }, TURN_TIMEOUT_MS);
-  } catch (error) {
-    failTurn(502, `gemini_submit_failed: ${error.message}`);
+    if (recentLines.length) {
+      instruction +=
+        "\n\nRecent saved conversation context. Continue naturally when relevant:\n" +
+        recentLines.join("\n");
+    }
+  }
+
+  return instruction;
+}
+
+function historyTurns(recentTurns) {
+  const turns = [];
+  for (const turn of recentTurns) {
+    if (turn.user_text) {
+      turns.push({ role: "user", parts: [{ text: turn.user_text }] });
+    }
+    if (turn.atlas_text) {
+      turns.push({ role: "model", parts: [{ text: turn.atlas_text }] });
+    }
+  }
+  return turns;
+}
+
+class PcmChunkQueue {
+  constructor() {
+    this.chunks = [];
+    this.headOffset = 0;
+    this.length = 0;
+  }
+
+  push(pcm) {
+    if (!pcm?.length) return;
+    const chunk = Buffer.from(pcm);
+    this.chunks.push(chunk);
+    this.length += chunk.length;
+  }
+
+  take(byteCount) {
+    if (byteCount <= 0 || this.length < byteCount) return null;
+
+    const output = Buffer.allocUnsafe(byteCount);
+    let outputOffset = 0;
+
+    while (outputOffset < byteCount) {
+      const head = this.chunks[0];
+      const available = head.length - this.headOffset;
+      const wanted = byteCount - outputOffset;
+      const copyCount = available < wanted ? available : wanted;
+
+      head.copy(
+        output,
+        outputOffset,
+        this.headOffset,
+        this.headOffset + copyCount,
+      );
+
+      outputOffset += copyCount;
+      this.headOffset += copyCount;
+      this.length -= copyCount;
+
+      if (this.headOffset >= head.length) {
+        this.chunks.shift();
+        this.headOffset = 0;
+      }
+    }
+
+    return output;
+  }
+
+  takeAllEven() {
+    const evenLength = this.length & ~1;
+    if (!evenLength) return null;
+    return this.take(evenLength);
+  }
+
+  clear() {
+    this.chunks = [];
+    this.headOffset = 0;
+    this.length = 0;
   }
 }
 
-async function handleTurn(req, res, parsed) {
-  if (!DEVICE_TOKEN || !API_KEY) {
-    json(res, 503, {
-      ok: false,
-      error: "relay_not_configured",
-      hasGeminiKey: Boolean(API_KEY),
-      hasDeviceToken: Boolean(DEVICE_TOKEN),
-    });
-    return;
-  }
-  if (!authorized(parsed)) {
-    json(res, 401, { ok: false, error: "unauthorized" });
-    return;
-  }
-  if (activeTurn || requestInProgress) {
-    json(res, 409, { ok: false, error: "atlas_busy" });
-    return;
+class PcmPacer {
+  constructor(atlas, onDrained) {
+    this.atlas = atlas;
+    this.onDrained = onDrained;
+    this.queue = new PcmChunkQueue();
+    this.timer = null;
+    this.done = false;
+    this.closed = false;
+    this.started = false;
+    this.nextSendAt = 0;
+    this.lateTicks = 0;
+    this.maxLateMs = 0;
+    this.backpressureWaits = 0;
   }
 
-  requestInProgress = true;
-  console.log("Atlas HTTP turn request received.");
-  try {
-    const ready = ensureSession(false);
-    const audio = await readBody(req);
-    await ready;
-    if (!audio.length) throw Object.assign(new Error("empty_audio"), { status: 400 });
-    if (audio.length % 2) throw Object.assign(new Error("odd_pcm_length"), { status: 400 });
-    console.log(`Atlas HTTP upload received. Bytes: ${audio.length}`);
-    submit(audio, res);
-  } catch (error) {
-    const status = error?.status || 503;
-    const message = error?.message || String(error);
-    console.error(`Atlas HTTP request failed: ${message}`);
-    if (!res.headersSent) json(res, status, { ok: false, error: message });
-    else if (!res.writableEnded) res.destroy();
-  } finally {
-    requestInProgress = false;
+  enqueue(pcm) {
+    if (this.closed || !pcm?.length) return;
+    this.queue.push(pcm);
+
+    // Keep a modest reserve before playback starts. PCM is held as chunks
+    // instead of repeatedly Buffer.concat-ing the whole response, avoiding
+    // growing copies and garbage-collection pauses during speech.
+    if (!this.timer &&
+        (this.started ||
+         this.done ||
+         this.queue.length >= PCM_START_BUFFER_BYTES)) {
+      this.schedule(0);
+    }
+  }
+
+  markDone() {
+    this.done = true;
+    if (!this.timer) this.schedule(0);
+  }
+
+  clear() {
+    this.closed = true;
+    this.queue.clear();
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  schedule(delay) {
+    if (this.closed || this.timer) return;
+    this.timer = setTimeout(() => this.tick(), Math.max(0, delay));
+  }
+
+  tick() {
+    this.timer = null;
+    if (this.closed) return;
+
+    if (this.atlas.readyState !== WebSocket.OPEN) {
+      this.clear();
+      return;
+    }
+
+    if (!this.started) {
+      if (!this.done && this.queue.length < PCM_START_BUFFER_BYTES) {
+        return;
+      }
+      this.started = true;
+      this.nextSendAt = Date.now();
+    }
+
+    if (this.atlas.bufferedAmount > ATLAS_BACKPRESSURE_BYTES) {
+      this.backpressureWaits++;
+      this.schedule(4);
+      return;
+    }
+
+    if (this.queue.length >= PCM_SLICE_BYTES) {
+      const slice = this.queue.take(PCM_SLICE_BYTES);
+      const now = Date.now();
+      const lateMs = Math.max(0, now - this.nextSendAt);
+
+      if (lateMs > 3) {
+        this.lateTicks++;
+        if (lateMs > this.maxLateMs) this.maxLateMs = lateMs;
+      }
+
+      // If the event loop was briefly delayed, reset only after a severe lag.
+      // Ordinary timer jitter is absorbed by the relay and ESP32 reserves.
+      if (this.nextSendAt < now - PCM_SLICE_MS * 4) {
+        this.nextSendAt = now;
+      }
+
+      try {
+        // Do not serialize the audio clock behind ws send callbacks. ws queues
+        // this frame immediately; bufferedAmount supplies backpressure.
+        this.atlas.send(slice, { binary: true }, (error) => {
+          if (error && !this.closed) {
+            console.error("Atlas PCM send failed:", error.message);
+            this.clear();
+          }
+        });
+      } catch (error) {
+        console.error("Atlas PCM send threw:", error.message);
+        this.clear();
+        return;
+      }
+
+      this.nextSendAt += PCM_SLICE_MS;
+      this.schedule(Math.max(0, this.nextSendAt - Date.now()));
+      return;
+    }
+
+    if (this.done) {
+      const tail = this.queue.takeAllEven();
+      this.queue.clear();
+
+      const complete = () => {
+        if (this.closed) return;
+        this.closed = true;
+        console.log(
+          `PCM pacing complete: lateTicks=${this.lateTicks} ` +
+            `maxLateMs=${this.maxLateMs} ` +
+            `backpressureWaits=${this.backpressureWaits}`,
+        );
+        this.onDrained();
+      };
+
+      if (tail?.length) {
+        this.atlas.send(tail, { binary: true }, (error) => {
+          if (error) {
+            console.error("Atlas final PCM send failed:", error.message);
+            this.clear();
+            return;
+          }
+          complete();
+        });
+      } else {
+        complete();
+      }
+      return;
+    }
+
+    // Gemini has not produced another full slice yet. Poll without advancing
+    // the audio clock; both ends retain enough PCM to absorb ordinary jitter.
+    this.schedule(3);
   }
 }
 
@@ -489,48 +478,748 @@ const server = http.createServer(async (req, res) => {
   try {
     parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   } catch {
-    json(res, 400, { ok: false, error: "bad_url" });
+    jsonResponse(res, 400, { ok: false, error: "bad_url" });
     return;
   }
 
   if (req.method === "GET" && (parsed.pathname === "/" || parsed.pathname === "/health")) {
-    json(res, 200, {
+    jsonResponse(res, 200, {
       ok: true,
       service: "atlas-live-relay",
-      version: VERSION,
-      mode: "proven-http-turn-persistent-gemini-finite-response",
-      configured: Boolean(API_KEY && DEVICE_TOKEN),
-      geminiReady: Boolean(session),
-      geminiConnecting: Boolean(connectPromise),
-      activeModel: sessionModel || null,
-      voice: VOICE,
-      busy: Boolean(activeTurn || requestInProgress),
-      completedTurns,
-      sessionConnections,
+      version: RELAY_VERSION,
+      model: GEMINI_PRIMARY_MODEL,
+      fallbackModel: GEMINI_FALLBACK_MODEL,
+      voice: ATLAS_VOICE,
+      mode: "continuous-live-pcm-official-genai-sdk",
+      geminiTransport: "official-google-genai-sdk",
+      uplink: "20ms-live-pcm",
+      downlink: "40ms-clocked-pcm-with-400ms-jitter-buffer",
+      transportHeartbeat: "activity-aware-120s-stale-timeout",
+      durableMemory: SUPABASE_ENABLED,
     });
     return;
   }
 
-  if (req.method === "GET" && parsed.pathname === "/warm") {
+  if (req.method === "GET" && parsed.pathname === "/api/chats") {
     if (!authorized(parsed)) {
-      json(res, 401, { ok: false, error: "unauthorized" });
+      jsonResponse(res, 401, { ok: false, error: "unauthorized" });
+      return;
+    }
+    if (!SUPABASE_ENABLED) {
+      jsonResponse(res, 503, { ok: false, error: "supabase_not_configured" });
       return;
     }
     try {
-      await ensureSession(false);
-      json(res, 200, { ok: true, geminiReady: true, model: sessionModel });
+      const deviceId = safeDeviceId(parsed.searchParams.get("device"));
+      const turns = await supabaseRequest(
+        `/rest/v1/atlas_turns?device_id=eq.${encodeURIComponent(deviceId)}` +
+          "&select=conversation_id,turn_index,user_text,atlas_text,created_at&order=created_at.desc&limit=100",
+      );
+      jsonResponse(res, 200, { ok: true, deviceId, turns });
     } catch (error) {
-      json(res, 503, { ok: false, error: error.message });
+      jsonResponse(res, 500, { ok: false, error: error.message });
     }
     return;
   }
 
-  if (req.method === "POST" && parsed.pathname === "/turn") {
-    await handleTurn(req, res, parsed);
+  if (parsed.pathname === "/api/memories") {
+    if (!authorized(parsed)) {
+      jsonResponse(res, 401, { ok: false, error: "unauthorized" });
+      return;
+    }
+    if (!SUPABASE_ENABLED) {
+      jsonResponse(res, 503, { ok: false, error: "supabase_not_configured" });
+      return;
+    }
+
+    const deviceId = safeDeviceId(parsed.searchParams.get("device"));
+    try {
+      if (req.method === "GET") {
+        const memories = await loadMemories(deviceId);
+        jsonResponse(res, 200, { ok: true, deviceId, memories });
+        return;
+      }
+
+      if (req.method === "POST") {
+        const body = await readJsonBody(req);
+        const content = String(body.content || "").trim();
+        if (!content) {
+          jsonResponse(res, 400, { ok: false, error: "content_required" });
+          return;
+        }
+        const memoryKey = String(body.memoryKey || body.memory_key || crypto.randomUUID())
+          .replace(/[^a-zA-Z0-9_.-]/g, "-")
+          .slice(0, 120);
+        const importance = Math.max(1, Math.min(10, Number(body.importance || 5)));
+        const rows = await supabaseRequest("/rest/v1/atlas_memories?on_conflict=device_id,memory_key", {
+          method: "POST",
+          prefer: "resolution=merge-duplicates,return=representation",
+          body: {
+            device_id: deviceId,
+            memory_key: memoryKey,
+            content: content.slice(0, 4000),
+            importance,
+            source: String(body.source || "manual").slice(0, 60),
+            active: body.active !== false,
+            updated_at: new Date().toISOString(),
+          },
+        });
+        jsonResponse(res, 200, { ok: true, deviceId, memory: rows?.[0] || null });
+        return;
+      }
+
+      if (req.method === "DELETE") {
+        const memoryKey = String(parsed.searchParams.get("memoryKey") || "").trim();
+        if (!memoryKey) {
+          jsonResponse(res, 400, { ok: false, error: "memoryKey_required" });
+          return;
+        }
+        await supabaseRequest(
+          `/rest/v1/atlas_memories?device_id=eq.${encodeURIComponent(deviceId)}` +
+            `&memory_key=eq.${encodeURIComponent(memoryKey)}`,
+          { method: "DELETE", prefer: "return=minimal" },
+        );
+        jsonResponse(res, 200, { ok: true, deviceId, deleted: memoryKey });
+        return;
+      }
+    } catch (error) {
+      jsonResponse(res, error.status || 500, { ok: false, error: error.message });
+      return;
+    }
+  }
+
+  jsonResponse(res, 404, { ok: false, error: "not_found" });
+});
+
+const atlasWss = new WebSocketServer({ noServer: true, maxPayload: MAX_ATLAS_MESSAGE_BYTES });
+
+server.on("upgrade", (req, socket, head) => {
+  let parsed;
+  try {
+    parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  } catch {
+    socket.destroy();
     return;
   }
 
-  json(res, 404, { ok: false, error: "not_found" });
+  if (parsed.pathname !== "/atlas") {
+    socket.destroy();
+    return;
+  }
+  if (!authorized(parsed)) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  req.atlasDeviceId = safeDeviceId(parsed.searchParams.get("device"));
+  atlasWss.handleUpgrade(req, socket, head, (ws) => atlasWss.emit("connection", ws, req));
+});
+
+atlasWss.on("connection", (atlas, req) => {
+  const deviceId = req.atlasDeviceId || "atlas-v1";
+
+  let geminiSession = null;
+  let geminiReady = false;
+  let geminiConnecting = false;
+  let closed = false;
+
+  let conversationId = null;
+  let recentTurns = [];
+  let memories = [];
+
+  let turnCounter = 0;
+  let currentTurn = null;
+  let pacer = null;
+
+  let activeGeminiModel = GEMINI_PRIMARY_MODEL;
+  let activeModelIndex = 0;
+  let geminiConnectionSerial = 0;
+  let geminiRetryTimer = null;
+  let atlasLastSeenAt = Date.now();
+  let atlasTransportHeartbeat = null;
+
+  const geminiModels = [...new Set(
+    [GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL].filter(Boolean),
+  )];
+
+  const sendAtlasJson = (payload) => {
+    if (atlas.readyState === WebSocket.OPEN) {
+      atlas.send(JSON.stringify(payload));
+    }
+  };
+
+  const resetTurn = () => {
+    currentTurn = {
+      id: crypto.randomUUID(),
+      deviceId,
+      conversationId,
+      turnIndex: ++turnCounter,
+      startedAt: Date.now(),
+      activityEndedAt: 0,
+      inputTranscript: "",
+      outputTranscript: "",
+      inputBytes: 0,
+      outputBytes: 0,
+      firstAudioLatencyMs: 0,
+      totalTurnMs: 0,
+      usage: {},
+      active: true,
+    };
+  };
+
+  const finishTurn = () => {
+    if (!currentTurn?.active) return;
+
+    currentTurn.active = false;
+    currentTurn.totalTurnMs = Date.now() - currentTurn.startedAt;
+    const savedTurn = { ...currentTurn };
+
+    setTimeout(() => {
+      // Input/output transcription events can arrive slightly after audio
+      // generation completes. Keep the latest fragments before saving.
+      if (currentTurn?.id === savedTurn.id) {
+        savedTurn.inputTranscript = currentTurn.inputTranscript;
+        savedTurn.outputTranscript = currentTurn.outputTranscript;
+      }
+
+      console.log(
+        `[${deviceId}] turn ${savedTurn.turnIndex}: ` +
+          `in=${savedTurn.inputBytes} out=${savedTurn.outputBytes} ` +
+          `firstAudio=${savedTurn.firstAudioLatencyMs}ms ` +
+          `total=${savedTurn.totalTurnMs}ms`,
+      );
+      console.log(
+        `[${deviceId}] YOU: ${savedTurn.inputTranscript || "<empty>"}`,
+      );
+      console.log(
+        `[${deviceId}] ATLAS: ${savedTurn.outputTranscript || "<empty>"}`,
+      );
+
+      void saveTurn(savedTurn).catch((error) =>
+        console.error("Save turn failed:", error.message),
+      );
+    }, TRANSCRIPT_SETTLE_MS);
+  };
+
+  const closeGeminiSession = () => {
+    const session = geminiSession;
+    geminiSession = null;
+    geminiReady = false;
+    geminiConnecting = false;
+
+    if (session) {
+      try {
+        session.close();
+      } catch (error) {
+        console.warn(
+          `[${deviceId}] Gemini close warning: ${error.message}`,
+        );
+      }
+    }
+  };
+
+  const closeAll = (code = 1000, reason = "session_closed") => {
+    if (closed) return;
+    closed = true;
+
+    if (geminiRetryTimer) clearTimeout(geminiRetryTimer);
+    geminiRetryTimer = null;
+    if (atlasTransportHeartbeat) clearInterval(atlasTransportHeartbeat);
+    atlasTransportHeartbeat = null;
+
+    pacer?.clear();
+    pacer = null;
+    closeGeminiSession();
+
+    if (
+      atlas.readyState === WebSocket.OPEN ||
+      atlas.readyState === WebSocket.CONNECTING
+    ) {
+      atlas.close(code, reason);
+    }
+  };
+
+  const handleGenerationDone = () => {
+    if (!currentTurn?.active) return;
+
+    if (!pacer) {
+      sendAtlasJson({ type: "generation_complete" });
+      sendAtlasJson({ type: "turn_complete" });
+      finishTurn();
+      return;
+    }
+
+    pacer.markDone();
+  };
+
+  const handleGeminiMessage = (message, connectionSerial) => {
+    if (
+      closed ||
+      connectionSerial !== geminiConnectionSerial ||
+      !message
+    ) {
+      return;
+    }
+
+    const content = message.serverContent;
+
+    if (content) {
+      if (content.interrupted) {
+        pacer?.clear();
+        pacer = null;
+        sendAtlasJson({ type: "interrupted" });
+      }
+
+      if (content.inputTranscription?.text && currentTurn) {
+        currentTurn.inputTranscript = mergeTranscript(
+          currentTurn.inputTranscript,
+          content.inputTranscription.text,
+        );
+        sendAtlasJson({
+          type: "input_transcript",
+          text: content.inputTranscription.text,
+        });
+      }
+
+      if (content.outputTranscription?.text && currentTurn) {
+        currentTurn.outputTranscript = mergeTranscript(
+          currentTurn.outputTranscript,
+          content.outputTranscription.text,
+        );
+        sendAtlasJson({
+          type: "output_transcript",
+          text: content.outputTranscription.text,
+        });
+      }
+
+      const parts = content.modelTurn?.parts || [];
+      for (const part of parts) {
+        const inline = part.inlineData;
+        if (
+          !inline?.data ||
+          !(inline.mimeType || "").startsWith("audio/pcm")
+        ) {
+          continue;
+        }
+
+        const pcm = Buffer.from(inline.data, "base64");
+        if (!currentTurn) resetTurn();
+
+        if (!currentTurn.firstAudioLatencyMs) {
+          currentTurn.firstAudioLatencyMs =
+            Date.now() - (currentTurn.activityEndedAt || currentTurn.startedAt);
+          sendAtlasJson({
+            type: "response_start",
+            latencyMs: currentTurn.firstAudioLatencyMs,
+          });
+        }
+
+        currentTurn.outputBytes += pcm.length;
+
+        if (!pacer || pacer.closed) {
+          pacer = new PcmPacer(atlas, () => {
+            sendAtlasJson({ type: "generation_complete" });
+            sendAtlasJson({ type: "turn_complete" });
+            finishTurn();
+            pacer = null;
+          });
+        }
+
+        pacer.enqueue(pcm);
+      }
+
+      // Different Live models/SDK versions may signal the end with either
+      // generationComplete or turnComplete. Mark the PCM pacer done on both;
+      // it sends turn_complete only after every queued audio byte is delivered.
+      if (content.generationComplete || content.turnComplete) {
+        console.log(
+          `[${deviceId}] Gemini end signal: generationComplete=` +
+            `${Boolean(content.generationComplete)} turnComplete=` +
+            `${Boolean(content.turnComplete)}`,
+        );
+        handleGenerationDone();
+      }
+    }
+
+    if (message.usageMetadata && currentTurn) {
+      currentTurn.usage = message.usageMetadata;
+    }
+
+    if (message.goAway) {
+      console.log(
+        `[${deviceId}] Gemini requested session rotation ` +
+          `model=${activeGeminiModel}.`,
+      );
+      sendAtlasJson({ type: "go_away", detail: message.goAway });
+
+      setTimeout(() => {
+        if (
+          !closed &&
+          connectionSerial === geminiConnectionSerial
+        ) {
+          closeGeminiSession();
+          scheduleGeminiConnect(0, 500, "Gemini session rotation");
+        }
+      }, 250);
+    }
+  };
+
+  const scheduleGeminiConnect = (modelIndex, delayMs, reason) => {
+    if (closed) return;
+
+    if (geminiRetryTimer) clearTimeout(geminiRetryTimer);
+
+    if (reason) {
+      console.log(
+        `[${deviceId}] Gemini reconnect scheduled in ${delayMs} ms: ${reason}`,
+      );
+    }
+
+    geminiRetryTimer = setTimeout(() => {
+      geminiRetryTimer = null;
+      void connectGemini(modelIndex);
+    }, delayMs);
+  };
+
+  const connectGemini = async (requestedModelIndex = 0) => {
+    if (closed || geminiConnecting) return;
+
+    activeModelIndex = Math.max(
+      0,
+      Math.min(requestedModelIndex, geminiModels.length - 1),
+    );
+    activeGeminiModel = geminiModels[activeModelIndex];
+
+    const connectionSerial = ++geminiConnectionSerial;
+    geminiConnecting = true;
+    geminiReady = false;
+
+    closeGeminiSession();
+    geminiConnecting = true;
+
+    console.log(
+      `[${deviceId}] Opening Gemini Live through official SDK ` +
+        `model=${activeGeminiModel} ` +
+        `(attempt ${activeModelIndex + 1}/${geminiModels.length})`,
+    );
+
+    const config = {
+      responseModalities: [Modality.AUDIO],
+      thinkingConfig: { thinkingLevel: "minimal" },
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: ATLAS_VOICE,
+          },
+        },
+      },
+      systemInstruction: {
+        parts: [
+          {
+            text: buildSystemInstruction(memories, recentTurns),
+          },
+        ],
+      },
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          disabled: true,
+        },
+      },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+    };
+
+    try {
+      const session = await googleAi.live.connect({
+        model: activeGeminiModel,
+        config,
+        callbacks: {
+          onopen: () => {
+            console.log(
+              `[${deviceId}] Gemini SDK socket opened ` +
+                `model=${activeGeminiModel}.`,
+            );
+          },
+
+          onmessage: (message) => {
+            handleGeminiMessage(message, connectionSerial);
+          },
+
+          onerror: (event) => {
+            if (connectionSerial !== geminiConnectionSerial) return;
+            const detail =
+              event?.message ||
+              event?.error?.message ||
+              String(event || "unknown Gemini SDK error");
+            console.error(
+              `[${deviceId}] Gemini SDK error ` +
+                `model=${activeGeminiModel}: ${detail}`,
+            );
+          },
+
+          onclose: (event) => {
+            if (connectionSerial !== geminiConnectionSerial) return;
+
+            const wasReady = geminiReady;
+            geminiReady = false;
+            geminiConnecting = false;
+            geminiSession = null;
+
+            const code = event?.code ?? 0;
+            const reason = event?.reason || "<empty>";
+
+            console.log(
+              `[${deviceId}] Gemini SDK closed: code=${code} ` +
+                `model=${activeGeminiModel} reason=${reason}`,
+            );
+
+            if (closed) return;
+
+            // If the socket closes before live.connect() resolves, its
+            // rejected promise handles model fallback. Only reconnect here
+            // when a previously established session later ends.
+            if (!wasReady) return;
+
+            sendAtlasJson({
+              type: "session_reconnecting",
+              reason: "gemini_session_closed",
+              code,
+            });
+            scheduleGeminiConnect(
+              0,
+              GEMINI_RETRY_DELAY_MS,
+              "established Live session closed",
+            );
+          },
+        },
+      });
+
+      if (
+        closed ||
+        connectionSerial !== geminiConnectionSerial
+      ) {
+        try {
+          session.close();
+        } catch {}
+        return;
+      }
+
+      // The SDK connect promise resolves only after the Live session setup
+      // has completed. This replaces our faulty hand-built setup handshake.
+      geminiSession = session;
+      geminiConnecting = false;
+      geminiReady = true;
+
+      sendAtlasJson({
+        type: "ready",
+        model: activeGeminiModel,
+        voice: ATLAS_VOICE,
+        conversationId,
+        resumed: false,
+        durableMemory: SUPABASE_ENABLED,
+        memoryCount: memories.length,
+      });
+
+      console.log(
+        `[${deviceId}] Gemini Live ready through official SDK. ` +
+          `model=${activeGeminiModel} ` +
+          `savedContextTurns=${recentTurns.length}`,
+      );
+    } catch (error) {
+      if (connectionSerial !== geminiConnectionSerial || closed) return;
+
+      geminiSession = null;
+      geminiReady = false;
+      geminiConnecting = false;
+
+      console.error(
+        `[${deviceId}] Gemini SDK connect failed ` +
+          `model=${activeGeminiModel}: ${error.message}`,
+      );
+
+      const nextModelIndex = activeModelIndex + 1;
+      if (nextModelIndex < geminiModels.length) {
+        scheduleGeminiConnect(
+          nextModelIndex,
+          350,
+          `primary SDK connection failed: ${error.message}`,
+        );
+        return;
+      }
+
+      sendAtlasJson({
+        type: "error",
+        source: "gemini",
+        message:
+          "Gemini Live setup failed through the official SDK on all " +
+          `configured models. Last error: ${error.message}`,
+      });
+
+      scheduleGeminiConnect(
+        0,
+        5000,
+        "all official SDK model connections failed",
+      );
+    }
+  };
+
+  atlas.on("message", (data, isBinary) => {
+    atlasLastSeenAt = Date.now();
+    if (isBinary) {
+      if (!geminiReady || !geminiSession) return;
+      if (!currentTurn?.active) return;
+
+      const audio = Buffer.from(data);
+      currentTurn.inputBytes += audio.length;
+
+      try {
+        geminiSession.sendRealtimeInput({
+          audio: {
+            data: audio.toString("base64"),
+            mimeType: "audio/pcm;rate=16000",
+          },
+        });
+      } catch (error) {
+        console.error(
+          `[${deviceId}] Gemini audio send failed: ${error.message}`,
+        );
+      }
+      return;
+    }
+
+    let control;
+    try {
+      control = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+
+    if (control.type === "ping") {
+      sendAtlasJson({ type: "pong", at: Date.now() });
+      return;
+    }
+
+    if (!geminiReady || !geminiSession) {
+      sendAtlasJson({
+        type: "session_reconnecting",
+        reason: "gemini_not_ready",
+      });
+      return;
+    }
+
+    if (control.type === "activity_start") {
+      pacer?.clear();
+      pacer = null;
+      resetTurn();
+
+      try {
+        geminiSession.sendRealtimeInput({ activityStart: {} });
+        sendAtlasJson({
+          type: "activity_started",
+          turnIndex: currentTurn.turnIndex,
+        });
+      } catch (error) {
+        console.error(
+          `[${deviceId}] activityStart failed: ${error.message}`,
+        );
+      }
+    } else if (control.type === "activity_end") {
+      if (currentTurn?.active) {
+        currentTurn.activityEndedAt = Date.now();
+        try {
+          geminiSession.sendRealtimeInput({ activityEnd: {} });
+          sendAtlasJson({
+            type: "activity_ended",
+            inputBytes: currentTurn.inputBytes,
+          });
+        } catch (error) {
+          console.error(
+            `[${deviceId}] activityEnd failed: ${error.message}`,
+          );
+        }
+      }
+    }
+  });
+
+
+  // Keep the Railway edge alive without killing an active ESP32 after one
+  // delayed pong. Any binary audio, control message, or pong proves liveness.
+  // The old one-strike policy caused otherwise healthy second turns to die.
+  atlas.on("pong", () => {
+    atlasLastSeenAt = Date.now();
+  });
+
+  atlasTransportHeartbeat = setInterval(() => {
+    if (closed || atlas.readyState !== WebSocket.OPEN) return;
+
+    const idleMs = Date.now() - atlasLastSeenAt;
+    if (idleMs > 120_000) {
+      console.warn(
+        `[${deviceId}] Atlas transport silent for ${idleMs} ms; ` +
+          "terminating genuinely stale socket.",
+      );
+      atlas.terminate();
+      return;
+    }
+
+    try {
+      atlas.ping();
+    } catch (error) {
+      console.error(`[${deviceId}] Atlas ping failed: ${error.message}`);
+    }
+  }, 20_000);
+
+  atlas.on("error", (error) => {
+    console.error(`[${deviceId}] Atlas socket error:`, error.message);
+  });
+
+  atlas.on("close", () => {
+    console.log(`[${deviceId}] Atlas disconnected.`);
+    closeAll(1000, "atlas_disconnected");
+  });
+
+  void (async () => {
+    try {
+      const [state, turns, storedMemories] = await Promise.all([
+        loadSessionState(deviceId),
+        loadRecentTurns(deviceId),
+        loadMemories(deviceId),
+      ]);
+
+      recentTurns = turns;
+      memories = storedMemories;
+
+      // Old raw-WebSocket session handles are deliberately cleared. Durable
+      // continuity is supplied from saved transcripts and memories instead.
+      if (state?.resume_handle) {
+        await clearSessionState(deviceId);
+      }
+
+      conversationId =
+        state?.conversation_id || (await createConversation(deviceId));
+
+      sendAtlasJson({
+        type: "relay_connected",
+        version: RELAY_VERSION,
+        durableMemory: SUPABASE_ENABLED,
+        geminiTransport: "official-google-genai-sdk",
+      });
+
+      await connectGemini(0);
+    } catch (error) {
+      console.error(
+        `[${deviceId}] relay initialization failed:`,
+        error.message,
+      );
+      sendAtlasJson({
+        type: "error",
+        source: "relay",
+        message: error.message,
+      });
+      closeAll(1011, "relay_initialization_failed");
+    }
+  })();
 });
 
 server.keepAliveTimeout = 65_000;
@@ -538,16 +1227,10 @@ server.headersTimeout = 70_000;
 server.requestTimeout = 0;
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Atlas Relay ${VERSION} listening on 0.0.0.0:${PORT}`);
-  console.log("ESP32: proven HTTPS POST /turn per completed recording");
-  console.log("Gemini: one persistent Live session reused between turns");
-  console.log("ESP32 HTTP: finite Content-Length response per turn");
-  console.log(`Configured: ${Boolean(API_KEY && DEVICE_TOKEN)}`);
-
-  if (API_KEY) {
-    void ensureSession(false).catch((error) => {
-      console.error("Initial Gemini warm-up failed:", error.message);
-      scheduleReconnect("initial warm-up");
-    });
-  }
+  console.log(`Atlas Live Relay ${RELAY_VERSION} listening on port ${PORT}`);
+  console.log("Gemini transport: official @google/genai Live SDK");
+  console.log(`Primary model: ${GEMINI_PRIMARY_MODEL}`);
+  console.log(`Fallback model: ${GEMINI_FALLBACK_MODEL}`);
+  console.log(`Voice: ${ATLAS_VOICE}`);
+  console.log(`Durable memory: ${SUPABASE_ENABLED ? "enabled" : "disabled"}`);
 });
